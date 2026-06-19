@@ -67,7 +67,7 @@ def arrow_safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                 return "Unavailable"
         except Exception:
             pass
-        return value if not isinstance(value, object) or isinstance(value, (int, float, bool)) else str(value)
+        return str(value)
 
     safe = df.copy()
     for column in safe.columns:
