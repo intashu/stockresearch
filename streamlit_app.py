@@ -48,10 +48,31 @@ def arrow_safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
+    def safe_cell(value: Any) -> Any:
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(item) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, default=str)
+        if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+            try:
+                converted = value.tolist()
+                if isinstance(converted, list):
+                    return ", ".join(str(item) for item in converted)
+                return str(converted)
+            except Exception:
+                return str(value)
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, type(pd.NA))) and missing:
+                return "Unavailable"
+        except Exception:
+            pass
+        return value if not isinstance(value, object) or isinstance(value, (int, float, bool)) else str(value)
+
     safe = df.copy()
     for column in safe.columns:
         if safe[column].dtype == "object":
-            safe[column] = safe[column].apply(lambda value: "Unavailable" if pd.isna(value) else str(value))
+            safe[column] = safe[column].apply(safe_cell)
     return safe
 
 
