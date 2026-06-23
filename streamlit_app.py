@@ -370,6 +370,18 @@ HEDGE_FUND_MODEL_CLAUSE = (
     "and latest close * latest volume > 500000000 "
     "and latest close >= 100 ) )"
 )
+LAUNCH_PAD_200_CLAUSE = (
+    "( {cash} ( "
+    "( ( latest close < latest ema ( close,200 ) and latest close >= latest ema ( close,190 ) ) "
+    "or ( latest close < latest sma ( close,200 ) and latest close >= latest sma ( close,190 ) ) ) "
+    "and latest close > latest ema ( close,50 ) "
+    "and latest close > latest ema ( close,100 ) "
+    "and latest ema ( close,20 ) > 5 days ago ema ( close,20 ) "
+    "and latest ema ( close,50 ) > 5 days ago ema ( close,50 ) "
+    "and latest ema ( close,100 ) > 5 days ago ema ( close,100 ) "
+    "and latest close * latest volume > 100000000 "
+    "and latest close >= 20 ) )"
+)
 
 INSTITUTIONAL_RULES = [
     "EMA20 > EMA50 > EMA100",
@@ -423,6 +435,19 @@ HEDGE_FUND_MODEL_WEIGHTS = {
     "relative_strength_score": 10,
     "sector_score": 5,
     "fundamental_score": 5,
+}
+
+LAUNCH_PAD_200_WEIGHTS = {
+    "near_200_ema_score": 20,
+    "near_200_sma_score": 20,
+    "delivery_score": 10,
+    "obv_score": 10,
+    "darvas_score": 10,
+    "vcp_score": 10,
+    "volume_score": 5,
+    "relative_strength_score": 5,
+    "sector_strength_score": 5,
+    "institutional_score": 5,
 }
 
 PROMPT_REFERENCE_TEXT = """
@@ -871,6 +896,7 @@ def sidebar_page_choice() -> str:
                 "Institutional Breakout Setup",
                 "Breakout Probability Model",
                 "Hedge Fund Stock Picker",
+                "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
             ],
             index=0,
@@ -2835,6 +2861,272 @@ def render_hedge_fund_model_page() -> None:
     )
 
 
+def score_launch_pad_candidate(row: pd.Series) -> dict[str, Any]:
+    symbol = str(row.get("nsecode") or "").strip().upper()
+    history = fetch_ohlcv_history(symbol)
+    if history.empty or len(history) < 220 or not {"close", "high", "low", "volume"}.issubset(history.columns):
+        return {
+            "total_score": 0,
+            "reason_for_selection": "Historical OHLCV data unavailable or insufficient for 200 EMA/SMA launch pad model.",
+        }
+
+    close = pd.to_numeric(history["close"], errors="coerce").dropna()
+    high = pd.to_numeric(history["high"], errors="coerce").dropna()
+    low = pd.to_numeric(history["low"], errors="coerce").dropna()
+    volume = pd.to_numeric(history["volume"], errors="coerce").dropna()
+    if len(close) < 220 or len(high) < 220 or len(low) < 220 or len(volume) < 60:
+        return {"total_score": 0, "reason_for_selection": "Not enough clean historical rows for model."}
+
+    latest_close = float(close.iloc[-1])
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    ema190 = close.ewm(span=190, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    sma190 = close.rolling(190).mean()
+    sma200 = close.rolling(200).mean()
+
+    latest_ema200 = float(ema200.iloc[-1])
+    latest_sma200 = float(sma200.iloc[-1])
+    latest_ema190 = float(ema190.iloc[-1])
+    latest_sma190 = float(sma190.iloc[-1])
+    distance_ema = (latest_ema200 - latest_close) / latest_ema200 * 100 if latest_ema200 else None
+    distance_sma = (latest_sma200 - latest_close) / latest_sma200 * 100 if latest_sma200 else None
+
+    previous_close = close.shift(1)
+    true_range = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+    atr14 = true_range.rolling(14).mean()
+    sma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    bb_width = ((sma20 + 2 * std20) - (sma20 - 2 * std20)) / sma20
+    bb_low_30 = bool(bb_width.iloc[-1] <= bb_width.tail(120).quantile(0.30))
+    direction = close.diff().fillna(0).apply(lambda value: 1 if value > 0 else -1 if value < 0 else 0)
+    obv = (direction * volume.fillna(0)).cumsum()
+    obv_30d_high = bool(obv.iloc[-1] >= obv.tail(30).max())
+    atr_contracting = bool(atr14.iloc[-1] < atr14.shift(5).iloc[-1]) if pd.notna(atr14.shift(5).iloc[-1]) else False
+    range_contracting = bool(((high - low) / close).tail(5).mean() < ((high - low) / close).shift(5).tail(5).mean())
+    vcp_detected = bool(bb_low_30 and atr_contracting and range_contracting)
+    recent_resistance = float(high.tail(55).max())
+    darvas_detected = bool(0 <= (recent_resistance - latest_close) / recent_resistance * 100 <= 5)
+    higher_lows = bool(low.tail(20).min() > low.shift(20).tail(20).min())
+    volume_ratio = float(volume.iloc[-1] / volume.tail(20).mean()) if volume.tail(20).mean() else 0
+    volume_expanding = bool(volume_ratio >= 1.1)
+    ema_improving = bool(
+        ema20.iloc[-1] > ema20.shift(5).iloc[-1]
+        and ema50.iloc[-1] > ema50.shift(5).iloc[-1]
+        and ema100.iloc[-1] > ema100.shift(5).iloc[-1]
+        and ema200.iloc[-1] >= ema200.shift(10).iloc[-1] * 0.995
+        and latest_close > ema50.iloc[-1]
+        and latest_close > ema100.iloc[-1]
+    )
+
+    delivery_snapshot = fetch_nse_delivery_snapshot(symbol)
+    delivery = delivery_snapshot.get("delivery_percentage")
+    delivery_qty = delivery_snapshot.get("delivery_quantity")
+    traded_qty = delivery_snapshot.get("traded_quantity")
+    if (delivery is None or pd.isna(delivery)) and delivery_qty and traded_qty:
+        delivery = delivery_qty / traded_qty * 100
+
+    near_ema = distance_ema is not None and 0 <= distance_ema <= 5 and latest_close >= latest_ema190
+    near_sma = distance_sma is not None and 0 <= distance_sma <= 5 and latest_close >= latest_sma190
+    near_195_ema = distance_ema is not None and 0 <= distance_ema <= ((latest_ema200 - close.ewm(span=195, adjust=False).mean().iloc[-1]) / latest_ema200 * 100 if latest_ema200 else 2.5)
+    near_195_sma = distance_sma is not None and 0 <= distance_sma <= ((latest_sma200 - close.rolling(195).mean().iloc[-1]) / latest_sma200 * 100 if latest_sma200 else 2.5)
+
+    near_200_ema_score = 20 if near_ema else 0
+    near_200_sma_score = 20 if near_sma else 0
+    delivery_score = 10 if delivery is not None and delivery > 50 else 0
+    obv_score = 10 if obv_30d_high else 0
+    darvas_score = 10 if darvas_detected else 0
+    vcp_score = 10 if vcp_detected else 0
+    volume_score = 5 if volume_expanding else 0
+    relative_strength_score = 5 if latest_close >= close.tail(60).quantile(0.70) else 2
+    sector_strength_score = 3
+    institutional_score = 5 if (delivery is not None and delivery > 50 and obv_30d_high) else 2
+    total_score = sum(
+        [
+            near_200_ema_score,
+            near_200_sma_score,
+            delivery_score,
+            obv_score,
+            darvas_score,
+            vcp_score,
+            volume_score,
+            relative_strength_score,
+            sector_strength_score,
+            institutional_score,
+        ]
+    )
+
+    signal_types: list[str] = []
+    if near_195_ema:
+        signal_types.append("Type A: 195-200 EMA zone")
+    if near_195_sma:
+        signal_types.append("Type B: 195-200 SMA zone")
+    if near_ema and near_sma:
+        signal_types.append("Type C: below both 200 EMA and 200 SMA")
+    if distance_ema is not None and 0 <= distance_ema <= 2 and delivery is not None and delivery > 60 and obv_30d_high and darvas_detected and vcp_detected:
+        signal_types.append("Type D: highest conviction")
+
+    probability = bounded_score(total_score, 100)
+    trend_change_probability = bounded_score(total_score * 0.75 + (10 if ema_improving else 0) + (5 if higher_lows else 0), 100)
+    window = "1-5 sessions" if total_score >= 85 else "5-15 sessions" if total_score >= 70 else "Watchlist"
+    reason = []
+    if near_ema:
+        reason.append("price is within 0-5% below 200 EMA")
+    if near_sma:
+        reason.append("price is within 0-5% below 200 SMA")
+    if ema_improving:
+        reason.append("20/50/100 EMA trend improving")
+    if vcp_detected:
+        reason.append("VCP compression detected")
+    if obv_30d_high:
+        reason.append("OBV near 30-day high")
+    if delivery is not None:
+        reason.append(f"delivery {delivery:.2f}%")
+
+    return {
+        "name": row.get("name", symbol),
+        "nsecode": symbol,
+        "current_price": round(latest_close, 2),
+        "200_ema": round(latest_ema200, 2),
+        "200_sma": round(latest_sma200, 2),
+        "distance_from_200_ema_pct": round(distance_ema, 2) if distance_ema is not None else None,
+        "distance_from_200_sma_pct": round(distance_sma, 2) if distance_sma is not None else None,
+        "delivery_pct": round(delivery, 2) if delivery is not None and pd.notna(delivery) else None,
+        "obv_trend": "30D high / rising" if obv_30d_high else "Not confirmed",
+        "institutional_score": institutional_score,
+        "breakout_probability": probability,
+        "expected_trend_change_probability": trend_change_probability,
+        "expected_breakout_window": window,
+        "total_score": total_score,
+        "signal_type": ", ".join(signal_types) if signal_types else "Base launch pad",
+        "vcp_detected": vcp_detected,
+        "darvas_box_detected": darvas_detected,
+        "higher_lows": higher_lows,
+        "volume_ratio": round(volume_ratio, 2),
+        "near_200_ema_score": near_200_ema_score,
+        "near_200_sma_score": near_200_sma_score,
+        "delivery_score": delivery_score,
+        "obv_score": obv_score,
+        "darvas_score": darvas_score,
+        "vcp_score": vcp_score,
+        "volume_score": volume_score,
+        "relative_strength_score": relative_strength_score,
+        "sector_strength_score": sector_strength_score,
+        "reason_for_selection": "; ".join(reason) if reason else "Launch pad conditions partially forming",
+    }
+
+
+def build_launch_pad_200_model(df: pd.DataFrame, history_limit: int = 120) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    rows: list[dict[str, Any]] = []
+    for _, row in df.head(history_limit).iterrows():
+        scored = score_launch_pad_candidate(row)
+        if scored.get("total_score", 0) > 0:
+            rows.append(scored)
+    model = pd.DataFrame(rows)
+    if model.empty:
+        return model
+    return model.sort_values(["total_score", "breakout_probability", "expected_trend_change_probability"], ascending=[False, False, False], kind="mergesort")
+
+
+def apply_launch_pad_filters(
+    model: pd.DataFrame,
+    min_total_score: int,
+    min_delivery: int,
+    max_ema_distance: float,
+    max_sma_distance: float,
+    require_obv: bool,
+    require_vcp: bool,
+    require_darvas: bool,
+) -> pd.DataFrame:
+    if model.empty:
+        return model
+    filtered = model[
+        (pd.to_numeric(model["total_score"], errors="coerce") >= min_total_score)
+        & (pd.to_numeric(model["delivery_pct"], errors="coerce").fillna(0) >= min_delivery)
+        & (pd.to_numeric(model["distance_from_200_ema_pct"], errors="coerce").between(0, max_ema_distance))
+        & (pd.to_numeric(model["distance_from_200_sma_pct"], errors="coerce").between(0, max_sma_distance))
+    ].copy()
+    if require_obv:
+        filtered = filtered[filtered["obv_trend"].astype(str).str.contains("30D high", na=False)]
+    if require_vcp:
+        filtered = filtered[filtered["vcp_detected"] == True]
+    if require_darvas:
+        filtered = filtered[filtered["darvas_box_detected"] == True]
+    return filtered.sort_values(["total_score", "breakout_probability"], ascending=[False, False], kind="mergesort")
+
+
+def render_launch_pad_200_page() -> None:
+    st.subheader("200 EMA / 200 SMA Launch Pad Scanner")
+    st.caption("Finds stocks approaching the 200-day EMA/SMA from below before potential trend reversal or Stage-2 breakout.")
+
+    with st.sidebar:
+        st.header("Launch Pad Controls")
+        rows_shown = st.slider("Rows shown", 5, 100, 25, 5, key="launch_rows")
+        history_limit = st.slider("Candidates to score", 20, 200, 120, 20, key="launch_history_limit")
+        st.divider()
+        min_total_score = st.slider("Minimum total score", 0, 100, 80, 1, key="launch_min_score")
+        min_delivery = st.slider("Minimum delivery %", 0, 100, 50, 1, key="launch_min_delivery")
+        max_ema_distance = st.slider("Max distance below 200 EMA %", 0.0, 10.0, 5.0, 0.5)
+        max_sma_distance = st.slider("Max distance below 200 SMA %", 0.0, 10.0, 5.0, 0.5)
+        require_obv = st.toggle("Require OBV 30D high", value=True)
+        require_vcp = st.toggle("Require VCP detected", value=True)
+        require_darvas = st.toggle("Require Darvas box detected", value=True)
+        if st.button("Refresh launch pad scanner", type="primary", width="stretch"):
+            run_scan.clear()
+            fetch_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            st.rerun()
+
+    with st.spinner("Fetching 200 EMA/SMA launch pad candidates..."):
+        df, error = run_scan(LAUNCH_PAD_200_CLAUSE)
+
+    if error:
+        st.error(error)
+        st.caption("If Chartink rejects the pre-filter, adjust LAUNCH_PAD_200_CLAUSE.")
+        return
+
+    model = build_launch_pad_200_model(df, history_limit=history_limit)
+    if model.empty:
+        st.info("No candidates returned by the launch pad pre-filter or historical scoring.")
+        return
+
+    filtered = apply_launch_pad_filters(
+        model,
+        min_total_score=min_total_score,
+        min_delivery=min_delivery,
+        max_ema_distance=max_ema_distance,
+        max_sma_distance=max_sma_distance,
+        require_obv=require_obv,
+        require_vcp=require_vcp,
+        require_darvas=require_darvas,
+    )
+
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Scored candidates", len(model))
+    metric_b.metric("Filtered candidates", len(filtered))
+    metric_c.metric("Top score", int((filtered if not filtered.empty else model).iloc[0]["total_score"]))
+
+    if filtered.empty:
+        st.warning("No stocks pass the current final filter. Loosen the sidebar filters or review the scored universe below.")
+    else:
+        st.subheader("Launch Pad Candidates")
+        display_dataframe(filtered.head(rows_shown), height=560)
+        st.download_button(
+            "Download launch pad candidates CSV",
+            filtered.to_csv(index=False).encode("utf-8"),
+            file_name="launch_pad_200_candidates.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    with st.expander("Scored universe before final filters", expanded=filtered.empty):
+        display_dataframe(model.head(rows_shown), height=520)
+
+
 def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("High Accuracy Candidates")
@@ -2872,6 +3164,9 @@ def main() -> None:
         return
     if selected_page == "Hedge Fund Stock Picker":
         render_hedge_fund_model_page()
+        return
+    if selected_page == "200 EMA/SMA Launch Pad":
+        render_launch_pad_200_page()
         return
     if selected_page == "Stock Technicals & SWOT Card":
         render_stock_analysis_card_page()
