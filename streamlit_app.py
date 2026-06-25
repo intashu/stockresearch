@@ -3408,7 +3408,7 @@ def score_ai_early_breakout_candidate(row: pd.Series) -> dict[str, Any]:
     if rs_vs_nifty is not None:
         reasons.append(f"20D RS vs Nifty {rs_vs_nifty:.2f}%")
 
-    return {
+    candidate = {
         "stock_name": row.get("name", symbol),
         "nsecode": symbol,
         "sector": row.get("sector", ""),
@@ -4181,6 +4181,41 @@ def render_iq5000_platform_page() -> None:
         )
         display_dataframe(weights_df)
 
+    with st.expander("Integrated workflow: Module 18 -> Module 15 -> Module 16", expanded=False):
+        st.markdown(
+            """
+            **After market close:** Module 18 builds the overnight watchlist.
+
+            **Before market open:** Module 15 compares each stock with saved historical analogs and assigns memory-adjusted probability.
+
+            **After first 15-30 minutes:** Module 16 consensus requires technical, quant, smart-money, memory, catalyst, risk, regime, and live price-action votes before a trade recommendation is allowed.
+            """
+        )
+        run_integrated_workflow = st.toggle("Run integrated overnight-memory-consensus workflow", value=False, key="iq5000_run_integrated_workflow")
+        if run_integrated_workflow:
+            with st.spinner("Running Module 18, Module 15, and Module 16 workflow..."):
+                overnight_df, overnight_error = run_scan(AI_OVERNIGHT_OPPORTUNITY_CLAUSE)
+            if overnight_error:
+                st.error(overnight_error)
+            else:
+                overnight_model = build_ai_overnight_model(
+                    overnight_df,
+                    market_regime=market_regime,
+                    history_limit=min(history_limit, 80),
+                )
+                if overnight_model.empty:
+                    st.info("No overnight-memory-consensus candidates were available.")
+                else:
+                    workflow_columns = ai_overnight_display_columns(overnight_model)
+                    display_dataframe(overnight_model[workflow_columns].head(rows_shown), height=560)
+                    st.download_button(
+                        "Download integrated workflow CSV",
+                        overnight_model.to_csv(index=False).encode("utf-8"),
+                        file_name="iq5000_integrated_overnight_memory_consensus.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+
     render_iq5000_learning_console()
 
 
@@ -4211,6 +4246,200 @@ def overnight_best_entry_window(
     if compression_score >= 80:
         return "10:00-10:30"
     return "After opening range confirmation"
+
+
+def overnight_pattern_label(candidate: dict[str, Any]) -> str:
+    patterns: list[str] = []
+    if candidate.get("vcp_status") == "Detected":
+        patterns.append("VCP")
+    if candidate.get("darvas_box_status") == "Detected":
+        patterns.append("Darvas")
+    if candidate.get("pocket_pivot_status") == "Detected":
+        patterns.append("Pocket Pivot")
+    if coerce_float(candidate.get("closing_strength_score"), 0) and coerce_float(candidate.get("closing_strength_score"), 0) >= 80:
+        patterns.append("Strong Close")
+    if coerce_float(candidate.get("delivery_pct"), 0) and coerce_float(candidate.get("delivery_pct"), 0) >= 60:
+        patterns.append("High Delivery")
+    if not patterns:
+        patterns.append("Overnight Watch")
+    return " + ".join(patterns)
+
+
+def score_module16_consensus(candidate: dict[str, Any]) -> dict[str, Any]:
+    closing_strength = coerce_float(candidate.get("closing_strength_score"), 0) or 0
+    compression = coerce_float(candidate.get("compression_score"), 0) or 0
+    relative_strength = coerce_float(candidate.get("relative_strength_score"), 0) or 0
+    tomorrow_probability = coerce_float(candidate.get("tomorrow_intraday_probability"), 0) or 0
+    orb_probability = coerce_float(candidate.get("opening_range_breakout_probability"), 0) or 0
+    vwap_probability = coerce_float(candidate.get("vwap_hold_probability"), 0) or 0
+    volume_score = coerce_float(candidate.get("volume_profile_score"), 0) or 0
+    delivery_score = coerce_float(candidate.get("delivery_score"), 0) or 0
+    auction_score = coerce_float(candidate.get("closing_auction_score"), 0) or 0
+    memory_score = coerce_float(candidate.get("market_memory_score"), 0) or 0
+    dna_score = coerce_float(candidate.get("market_dna_score"), 0) or 0
+    similarity_probability = coerce_float(candidate.get("similarity_based_probability"), tomorrow_probability) or tomorrow_probability
+    news_score = coerce_float(candidate.get("news_catalyst_score"), 0) or 0
+    liquidity_score = coerce_float(candidate.get("liquidity_score"), 0) or 0
+    risk_reward = coerce_float(candidate.get("risk_to_reward_estimate"), 0) or 0
+    gap_down = coerce_float(candidate.get("gap_down_probability"), 50) or 50
+    market_score = coerce_float(candidate.get("market_regime_score"), 60) or 60
+
+    experts = [
+        {
+            "Expert": "Technical",
+            "Score": bounded_score(closing_strength * 0.35 + compression * 0.25 + relative_strength * 0.25 + tomorrow_probability * 0.15, 100),
+            "Reason": "Closing strength, compression, and relative strength.",
+        },
+        {
+            "Expert": "Quant",
+            "Score": bounded_score(tomorrow_probability * 0.35 + orb_probability * 0.25 + vwap_probability * 0.20 + volume_score * 0.20, 100),
+            "Reason": "Probability, ORB, VWAP hold, and volume expansion.",
+        },
+        {
+            "Expert": "Smart Money",
+            "Score": bounded_score(delivery_score * 0.35 + volume_score * 0.30 + auction_score * 0.20 + relative_strength * 0.15, 100),
+            "Reason": "Delivery, closing volume, auction proxy, and RS.",
+        },
+        {
+            "Expert": "Market Memory",
+            "Score": bounded_score(memory_score * 0.35 + dna_score * 0.25 + similarity_probability * 0.25 + market_score * 0.15, 100),
+            "Reason": "Historical analogs, market DNA, and regime context.",
+        },
+        {
+            "Expert": "Fundamental/Catalyst",
+            "Score": bounded_score(news_score * 0.55 + relative_strength * 0.25 + market_score * 0.20, 100),
+            "Reason": "Catalyst proxy, RS, and market support.",
+        },
+        {
+            "Expert": "Risk",
+            "Score": bounded_score(liquidity_score * 0.35 + min(risk_reward * 25, 100) * 0.35 + (100 - gap_down) * 0.30, 100),
+            "Reason": "Liquidity, risk/reward, and gap-down risk.",
+        },
+        {
+            "Expert": "Market Regime",
+            "Score": bounded_score(market_score, 100),
+            "Reason": "Index trend, breadth proxy, and volatility regime.",
+        },
+        {
+            "Expert": "Live Price Action Gate",
+            "Score": bounded_score(orb_probability * 0.35 + vwap_probability * 0.35 + volume_score * 0.30, 100),
+            "Reason": "Pre-open proxy; must be confirmed after first 15-30 minutes.",
+        },
+    ]
+
+    for expert in experts:
+        expert["Vote"] = "Approve" if expert["Score"] >= 70 else "Reject/Wait"
+
+    votes_for = sum(1 for expert in experts if expert["Vote"] == "Approve")
+    consensus_score = bounded_score(sum(expert["Score"] for expert in experts) / len(experts), 100)
+    vote_text = f"{votes_for}/{len(experts)}"
+
+    if consensus_score >= 85 and votes_for >= 7:
+        decision = "Strong consensus - eligible after live confirmation"
+    elif consensus_score >= 75 and votes_for >= 6:
+        decision = "Conditional consensus - wait for live confirmation"
+    elif consensus_score >= 65 and votes_for >= 5:
+        decision = "Watchlist only - needs stronger live evidence"
+    else:
+        decision = "No trade - consensus not strong enough"
+
+    live_checks = [
+        "Price above VWAP",
+        "Opening range breakout confirmed",
+        "Relative volume above 2",
+        "No major selling pressure",
+        "AI intraday score above 90",
+        "Market regime still supportive",
+        "Smart money score above threshold",
+    ]
+    if decision.startswith("Strong") or decision.startswith("Conditional"):
+        live_gate = "Trade recommendation only after all live checks pass"
+    elif decision.startswith("Watchlist"):
+        live_gate = "Watchlist only until live checks improve"
+    else:
+        live_gate = "Do not generate trade recommendation"
+
+    return {
+        "module16_consensus_score": consensus_score,
+        "module16_votes": vote_text,
+        "module16_decision": decision,
+        "final_trade_gate": live_gate,
+        "live_confirmation_checklist": "; ".join(live_checks),
+        "consensus_expert_votes": "; ".join(f"{expert['Expert']}: {expert['Vote']} ({expert['Score']})" for expert in experts),
+    }
+
+
+def apply_module15_memory_to_overnight(candidate: dict[str, Any]) -> dict[str, Any]:
+    initialize_iq5000_memory_state()
+    pattern = overnight_pattern_label(candidate)
+    pattern_count = sum(
+        [
+            candidate.get("vcp_status") == "Detected",
+            candidate.get("darvas_box_status") == "Detected",
+            candidate.get("pocket_pivot_status") == "Detected",
+            (coerce_float(candidate.get("delivery_pct"), 0) or 0) >= 50,
+            (coerce_float(candidate.get("closing_strength_score"), 0) or 0) >= 75,
+            (coerce_float(candidate.get("volume_profile_score"), 0) or 0) >= 70,
+        ]
+    )
+    fallback_similarity = bounded_score(35 + pattern_count * 8 + ((coerce_float(candidate.get("market_regime_score"), 60) or 60) - 50) * 0.25, 100)
+    memory = get_iq5000_memory_estimate(
+        pattern,
+        str(candidate.get("sector") or ""),
+        str(candidate.get("market_regime") or ""),
+        fallback_similarity,
+    )
+    historical_win_rate = coerce_float(memory.get("historical_win_rate"), 50) or 50
+    historical_behaviour = coerce_float(candidate.get("historical_behaviour_score"), 0) or 0
+    tomorrow_probability = coerce_float(candidate.get("tomorrow_intraday_probability"), 0) or 0
+    market_score = coerce_float(candidate.get("market_regime_score"), 60) or 60
+    delivery_score = coerce_float(candidate.get("delivery_score"), 0) or 0
+    relative_strength = coerce_float(candidate.get("relative_strength_score"), 0) or 0
+    memory_score = bounded_score(
+        historical_win_rate * 0.30
+        + historical_behaviour * 0.25
+        + fallback_similarity * 0.20
+        + market_score * 0.15
+        + relative_strength * 0.10,
+        100,
+    )
+    market_dna_score = bounded_score(
+        fallback_similarity * 0.30
+        + historical_win_rate * 0.25
+        + delivery_score * 0.15
+        + relative_strength * 0.15
+        + tomorrow_probability * 0.15,
+        100,
+    )
+    similarity_based_probability = bounded_score(
+        tomorrow_probability * 0.45
+        + historical_win_rate * 0.25
+        + memory_score * 0.20
+        + fallback_similarity * 0.10,
+        100,
+    )
+    return {
+        "module15_pattern": pattern,
+        "similarity_score": fallback_similarity,
+        "market_memory_score": memory_score,
+        "market_dna_score": market_dna_score,
+        "similarity_based_probability": similarity_based_probability,
+        "number_of_similar_historical_setups": memory.get("number_of_similar_setups"),
+        "historical_win_rate": memory.get("historical_win_rate"),
+        "historical_average_return": memory.get("historical_average_return"),
+        "historical_average_holding_days": memory.get("historical_average_holding_days"),
+        "best_historical_exit": memory.get("best_historical_exit"),
+        "best_historical_stop_loss": memory.get("best_historical_stop_loss"),
+        "most_similar_historical_stock": memory.get("most_similar_historical_stock"),
+        "most_similar_historical_date": memory.get("most_similar_historical_date"),
+    }
+
+
+def integrate_overnight_memory_consensus(candidate: dict[str, Any]) -> dict[str, Any]:
+    enhanced = dict(candidate)
+    enhanced.update(apply_module15_memory_to_overnight(enhanced))
+    enhanced.update(score_module16_consensus(enhanced))
+    return enhanced
 
 
 def score_ai_overnight_candidate(row: pd.Series, market_regime: dict[str, Any]) -> dict[str, Any]:
@@ -4473,6 +4702,7 @@ def score_ai_overnight_candidate(row: pd.Series, market_regime: dict[str, Any]) 
         "market_regime_score": market_score,
         "reason_for_selection": "; ".join(reason) if reason else "Overnight setup is not mature yet",
     }
+    return integrate_overnight_memory_consensus(candidate)
 
 
 def build_ai_overnight_model(df: pd.DataFrame, market_regime: dict[str, Any], history_limit: int = 100) -> pd.DataFrame:
@@ -4487,7 +4717,7 @@ def build_ai_overnight_model(df: pd.DataFrame, market_regime: dict[str, Any], hi
     if model.empty:
         return model
     return model.sort_values(
-        ["tomorrow_intraday_probability", "opening_range_breakout_probability", "liquidity_score"],
+        ["similarity_based_probability", "module16_consensus_score", "tomorrow_intraday_probability"],
         ascending=[False, False, False],
         kind="mergesort",
     )
@@ -4502,6 +4732,8 @@ def apply_ai_overnight_filters(
     min_closing_strength: int,
     min_rr: float,
     min_turnover: int,
+    min_memory_probability: int = 0,
+    min_consensus_score: int = 0,
 ) -> pd.DataFrame:
     if model.empty:
         return model
@@ -4513,8 +4745,10 @@ def apply_ai_overnight_filters(
         & (pd.to_numeric(model["closing_strength_score"], errors="coerce") >= min_closing_strength)
         & (pd.to_numeric(model["risk_to_reward_estimate"], errors="coerce") >= min_rr)
         & (pd.to_numeric(model["turnover_cr"], errors="coerce").fillna(0) >= min_turnover)
+        & (pd.to_numeric(model["similarity_based_probability"], errors="coerce").fillna(0) >= min_memory_probability)
+        & (pd.to_numeric(model["module16_consensus_score"], errors="coerce").fillna(0) >= min_consensus_score)
     ].copy()
-    return filtered.sort_values(["tomorrow_intraday_probability", "gap_up_probability"], ascending=[False, False], kind="mergesort")
+    return filtered.sort_values(["similarity_based_probability", "module16_consensus_score"], ascending=[False, False], kind="mergesort")
 
 
 def ai_overnight_display_columns(df: pd.DataFrame) -> list[str]:
@@ -4524,6 +4758,11 @@ def ai_overnight_display_columns(df: pd.DataFrame) -> list[str]:
         "sector",
         "current_price",
         "tomorrow_intraday_probability",
+        "similarity_based_probability",
+        "module16_consensus_score",
+        "module16_votes",
+        "module16_decision",
+        "final_trade_gate",
         "classification",
         "gap_up_probability",
         "opening_range_breakout_probability",
@@ -4540,9 +4779,14 @@ def ai_overnight_display_columns(df: pd.DataFrame) -> list[str]:
         "compression_score",
         "news_catalyst_score",
         "historical_behaviour_score",
+        "market_memory_score",
+        "market_dna_score",
+        "historical_win_rate",
+        "number_of_similar_historical_setups",
         "liquidity_score",
         "risk_to_reward_estimate",
         "turnover_cr",
+        "live_confirmation_checklist",
         "reason_for_selection",
     ]
     return [column for column in columns if column in df.columns]
@@ -4564,6 +4808,8 @@ def render_ai_overnight_opportunity_page() -> None:
         min_closing_strength = st.slider("Minimum closing strength", 0, 100, 60, 1, key="overnight_min_close")
         min_rr = st.slider("Minimum risk/reward estimate", 1.0, 5.0, 2.0, 0.25, key="overnight_min_rr")
         min_turnover = st.slider("Minimum turnover crore", 0, 250, 20, 5, key="overnight_min_turnover")
+        min_memory_probability = st.slider("Minimum memory probability", 0, 100, 60, 1, key="overnight_min_memory")
+        min_consensus_score = st.slider("Minimum consensus score", 0, 100, 65, 1, key="overnight_min_consensus")
         if st.button("Refresh overnight opportunity", type="primary", width="stretch"):
             run_scan.clear()
             fetch_ohlcv_history.clear()
@@ -4577,6 +4823,15 @@ def render_ai_overnight_opportunity_page() -> None:
     metric_a.metric("Market Regime", str(market_regime.get("market_regime")))
     metric_b.metric("Regime Score", int(market_regime.get("market_regime_score", 0)))
     metric_c.metric("Engine", "Tomorrow EOD")
+
+    with st.expander("M18 + M15 + M16 workflow", expanded=True):
+        st.markdown(
+            """
+            1. **After market close:** Module 18 ranks overnight candidates from EOD price, volume, delivery, compression, RS, catalyst, and liquidity evidence.
+            2. **Before market open:** Module 15 adds market-memory context using similar historical setups, historical win rate, market DNA, and similarity-based probability.
+            3. **After first 15-30 minutes:** Module 16 asks the expert committee to vote. The app should only move from watchlist to trade idea after live VWAP, ORB, RVOL, and selling-pressure checks confirm.
+            """
+        )
 
     with st.expander("Confirmation rule before next-day entry"):
         st.markdown(
@@ -4612,12 +4867,14 @@ def render_ai_overnight_opportunity_page() -> None:
         min_closing_strength=min_closing_strength,
         min_rr=min_rr,
         min_turnover=min_turnover,
+        min_memory_probability=min_memory_probability,
+        min_consensus_score=min_consensus_score,
     )
 
     metric_d, metric_e, metric_f = st.columns(3)
     metric_d.metric("Scored candidates", len(model))
     metric_e.metric("Final watchlist", len(filtered))
-    metric_f.metric("Top probability", int((filtered if not filtered.empty else model).iloc[0]["tomorrow_intraday_probability"]))
+    metric_f.metric("Top memory probability", int((filtered if not filtered.empty else model).iloc[0]["similarity_based_probability"]))
 
     if filtered.empty:
         st.warning("No stocks pass the current overnight filter. Loosen the controls or review the full scored universe below.")
