@@ -392,6 +392,80 @@ AI_EARLY_BREAKOUT_CLAUSE = (
     "and latest close >= 50 ) )"
 )
 
+IQ5000_MASTER_WEIGHTS = {
+    "market_regime_score": 100,
+    "ai_intraday_score": 150,
+    "ai_swing_score": 150,
+    "ai_institutional_score": 200,
+    "ai_early_breakout_score": 200,
+    "smart_money_score": 50,
+    "swot_advantage_score": 50,
+    "fundamental_score": 50,
+    "trade_probability": 50,
+    "risk_management_score": 50,
+}
+
+IQ5000_TRADE_LOG_COLUMNS = [
+    "Trade ID",
+    "Date",
+    "Stock Name",
+    "Sector",
+    "Market Regime",
+    "Entry Price",
+    "Exit Price",
+    "Stop Loss",
+    "Target",
+    "Actual Profit/Loss",
+    "Holding Time",
+    "Quantity",
+    "Capital Used",
+    "Risk Amount",
+    "Reward Amount",
+    "AI IQ Score",
+    "AI Intraday Score",
+    "AI Swing Score",
+    "AI Institutional Score",
+    "AI Early Breakout Score",
+    "Smart Money Score",
+    "SWOT Advantage Score",
+    "Trade Probability Score",
+    "Pattern Detected",
+    "Delivery Percentage",
+    "Delivery Trend",
+    "OBV Trend",
+    "Relative Strength",
+    "Sector Strength",
+    "VCP Status",
+    "Darvas Status",
+    "Pocket Pivot Status",
+    "ATR",
+    "Bollinger Width",
+    "200 EMA Distance",
+    "52 Week High Distance",
+    "Reason For Entry",
+    "Reason For Exit",
+]
+
+IQ5000_MARKET_MEMORY_COLUMNS = [
+    "Date",
+    "Stock",
+    "Sector",
+    "Market Regime",
+    "Pattern Type",
+    "Delivery Percentage",
+    "OBV Trend",
+    "Relative Strength",
+    "VCP",
+    "Darvas Box",
+    "Pocket Pivot",
+    "200 EMA Distance",
+    "52 Week High Distance",
+    "AI IQ Score",
+    "Trade Outcome",
+    "Similarity Score",
+    "Market DNA Score",
+]
+
 INSTITUTIONAL_RULES = [
     "EMA20 > EMA50 > EMA100",
     "Price > EMA200",
@@ -832,12 +906,7 @@ def render_scan_card(scan: Scan, df: pd.DataFrame, error: str | None, rows_per_s
             st.info("No matching stocks found.")
             return
 
-        st.dataframe(
-            df.head(rows_per_scan),
-            width="stretch",
-            hide_index=True,
-            height=min(420, 72 + (rows_per_scan * 35)),
-        )
+        display_dataframe(df.head(rows_per_scan), height=min(420, 72 + (rows_per_scan * 35)))
 
         page_csv = df.head(rows_per_scan).to_csv(index=False).encode("utf-8")
         all_csv = df.to_csv(index=False).encode("utf-8")
@@ -905,6 +974,7 @@ def sidebar_page_choice() -> str:
                 "Institutional Breakout Setup",
                 "Breakout Probability Model",
                 "Hedge Fund Stock Picker",
+                "IQ-5000 AI Platform",
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
@@ -1256,6 +1326,16 @@ def percent_gap(reference: float | None, current: float | None) -> float | None:
     return (reference - current) / reference * 100
 
 
+def coerce_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    except Exception:
+        return default
+    if pd.isna(number):
+        return default
+    return float(number)
+
+
 def normalize_ohlcv_columns(history: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
         return history
@@ -1478,7 +1558,7 @@ def render_overlap_table(overlap_df: pd.DataFrame) -> None:
 
         st.caption("Sorted by unique scanner logic count. Duplicate scanner clauses are counted once to avoid inflated confirmation.")
         display_df = overlap_df[preferred_overlap_columns(overlap_df)]
-        st.dataframe(display_df, width="stretch", hide_index=True, height=420)
+        display_dataframe(display_df, height=420)
         st.download_button(
             "Download repeated stocks CSV",
             display_df.to_csv(index=False).encode("utf-8"),
@@ -1499,7 +1579,7 @@ def render_best_setup_watchlist(best_setup_df: pd.DataFrame) -> None:
             st.info("No best-setup candidates are available yet. Run more scanners or wait for stronger confirmation.")
             return
 
-        st.dataframe(best_setup_df, width="stretch", hide_index=True, height=420)
+        display_dataframe(best_setup_df, height=420)
         st.download_button(
             "Download best setup watchlist CSV",
             best_setup_df.to_csv(index=False).encode("utf-8"),
@@ -1626,7 +1706,7 @@ def render_institutional_setup_page() -> None:
 
     with st.expander("14-point setup checklist", expanded=True):
         checklist_df = pd.DataFrame({"Rule": range(1, len(INSTITUTIONAL_RULES) + 1), "Condition": INSTITUTIONAL_RULES})
-        st.dataframe(checklist_df, width="stretch", hide_index=True, height=420)
+        display_dataframe(checklist_df, height=420)
 
     with st.sidebar:
         st.header("Institutional Setup Controls")
@@ -1650,7 +1730,7 @@ def render_institutional_setup_page() -> None:
         return
 
     st.metric("Recommended setup candidates", len(candidates))
-    st.dataframe(candidates.head(institutional_rows), width="stretch", hide_index=True, height=520)
+    display_dataframe(candidates.head(institutional_rows), height=520)
     st.download_button(
         "Download institutional setup candidates CSV",
         candidates.to_csv(index=False).encode("utf-8"),
@@ -1929,7 +2009,7 @@ def render_breakout_probability_page() -> None:
                 "Weight": list(BREAKOUT_PHASE_WEIGHTS.values()),
             }
         )
-        st.dataframe(phase_df, width="stretch", hide_index=True, height=380)
+        display_dataframe(phase_df, height=380)
 
     with st.sidebar:
         st.header("Breakout Model Controls")
@@ -1964,7 +2044,7 @@ def render_breakout_probability_page() -> None:
     metric_b.metric("Top probability score", int(best["probability_score"]))
     metric_c.metric("Top candidate", str(best.get("nsecode") or best.get("name") or "N/A"))
 
-    st.dataframe(model.head(breakout_rows), width="stretch", hide_index=True, height=560)
+    display_dataframe(model.head(breakout_rows), height=560)
     st.download_button(
         "Download breakout probability candidates CSV",
         model.to_csv(index=False).encode("utf-8"),
@@ -2822,7 +2902,7 @@ def render_hedge_fund_model_page() -> None:
             if swot_df.empty:
                 st.info("No historical data found for this symbol.")
             else:
-                st.dataframe(swot_df, width="stretch", hide_index=True, height=260)
+                display_dataframe(swot_df, height=260)
 
     model = build_hedge_fund_model(df, use_history=use_history and yf is not None, history_limit=history_limit)
     if model.empty:
@@ -2850,7 +2930,7 @@ def render_hedge_fund_model_page() -> None:
         st.warning("No stocks pass the current final filter parameters. Loosen the sliders in the sidebar or review the scored universe below.")
     else:
         st.subheader("Filtered Recommendations")
-        st.dataframe(filtered_model[hedge_fund_display_columns(filtered_model)].head(rows_shown), width="stretch", hide_index=True, height=620)
+        display_dataframe(filtered_model[hedge_fund_display_columns(filtered_model)].head(rows_shown), height=620)
         st.download_button(
             "Download filtered hedge fund candidates CSV",
             filtered_model[hedge_fund_display_columns(filtered_model)].to_csv(index=False).encode("utf-8"),
@@ -2860,7 +2940,7 @@ def render_hedge_fund_model_page() -> None:
         )
 
     with st.expander("Scored universe before final filters", expanded=filtered_model.empty):
-        st.dataframe(model[hedge_fund_display_columns(model)].head(rows_shown), width="stretch", hide_index=True, height=520)
+        display_dataframe(model[hedge_fund_display_columns(model)].head(rows_shown), height=520)
 
     st.download_button(
         "Download scored universe CSV",
@@ -3422,6 +3502,667 @@ def render_ai_early_breakout_page() -> None:
         display_dataframe(model.head(rows_shown), height=560)
 
 
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def compute_iq5000_market_regime() -> dict[str, Any]:
+    index_specs = [
+        ("^NSEI", "NIFTY trend", 40, False),
+        ("^NSEBANK", "BANKNIFTY trend", 20, False),
+        ("^CNXMDCP", "Midcap trend", 15, False),
+        ("^CNXSC", "Smallcap trend", 15, False),
+        ("^INDIAVIX", "India VIX", 10, True),
+    ]
+    weighted_score = 0.0
+    available_weight = 0.0
+    details: list[dict[str, Any]] = []
+
+    for ticker, label, weight, inverse in index_specs:
+        history = fetch_ohlcv_history(ticker, lookback_days=300)
+        if history.empty or "close" not in history.columns:
+            details.append({"Component": label, "Score": "Unavailable", "Status": "Data unavailable"})
+            continue
+
+        close = pd.to_numeric(history["close"], errors="coerce").dropna()
+        if len(close) < 80:
+            details.append({"Component": label, "Score": "Unavailable", "Status": "Insufficient history"})
+            continue
+
+        latest = float(close.iloc[-1])
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        ema100 = close.ewm(span=100, adjust=False).mean()
+        ret20 = (close.iloc[-1] / close.iloc[-21] - 1) * 100 if len(close) > 21 and close.iloc[-21] else 0
+
+        if inverse:
+            component_score = 100
+            component_score -= 35 if latest > ema20.iloc[-1] else 0
+            component_score -= 25 if latest > ema50.iloc[-1] else 0
+            component_score -= 20 if ret20 > 5 else 0
+            component_score = bounded_score(component_score, 100)
+            status = "Risk-on volatility" if component_score >= 70 else "Volatility headwind"
+        else:
+            component_score = 0
+            component_score += 25 if latest > ema20.iloc[-1] else 0
+            component_score += 25 if latest > ema50.iloc[-1] else 0
+            component_score += 20 if ema20.iloc[-1] > ema50.iloc[-1] else 0
+            component_score += 15 if ema50.iloc[-1] > ema100.iloc[-1] else 0
+            component_score += 15 if ret20 > 0 else 0
+            component_score = bounded_score(component_score, 100)
+            status = "Improving" if component_score >= 70 else "Weak/neutral"
+
+        weighted_score += component_score / 100 * weight
+        available_weight += weight
+        details.append({"Component": label, "Score": component_score, "Status": status, "20D Return %": round(ret20, 2)})
+
+    if available_weight == 0:
+        score = 60
+        details.append({"Component": "Fallback", "Score": score, "Status": "Neutral regime used because index data was unavailable"})
+    else:
+        score = bounded_score(weighted_score / available_weight * 100, 100)
+
+    if score >= 85:
+        label = "Strong Bullish"
+    elif score >= 70:
+        label = "Bullish"
+    elif score >= 55:
+        label = "Neutral"
+    elif score >= 40:
+        label = "Bearish"
+    else:
+        label = "Strong Bearish"
+
+    return {
+        "market_regime_score": score,
+        "market_regime": label,
+        "details": details,
+    }
+
+
+def iq5000_pattern_label(candidate: dict[str, Any]) -> str:
+    patterns: list[str] = []
+    if candidate.get("darvas_box_status") == "Detected":
+        patterns.append("Darvas")
+    if candidate.get("vcp_status") == "Detected":
+        patterns.append("VCP")
+    if candidate.get("pocket_pivot_status") == "Detected":
+        patterns.append("Pocket Pivot")
+    if not patterns:
+        patterns.append("Early Breakout Watch")
+    return " + ".join(patterns)
+
+
+def initialize_iq5000_memory_state() -> None:
+    if "iq5000_trade_log" not in st.session_state:
+        st.session_state["iq5000_trade_log"] = pd.DataFrame(columns=IQ5000_TRADE_LOG_COLUMNS)
+    if "iq5000_market_memory" not in st.session_state:
+        st.session_state["iq5000_market_memory"] = pd.DataFrame(columns=IQ5000_MARKET_MEMORY_COLUMNS)
+
+
+def get_iq5000_memory_estimate(pattern: str, sector: str, market_regime: str, fallback_similarity: int) -> dict[str, Any]:
+    trade_log = st.session_state.get("iq5000_trade_log", pd.DataFrame())
+    if not isinstance(trade_log, pd.DataFrame) or trade_log.empty:
+        estimated_win_rate = bounded_score(48 + fallback_similarity * 0.35, 100)
+        return {
+            "number_of_similar_setups": 0,
+            "historical_win_rate": estimated_win_rate,
+            "historical_average_return": round((estimated_win_rate - 50) / 8, 2),
+            "historical_average_holding_days": "Unavailable",
+            "best_historical_exit": "ATR trailing stop",
+            "best_historical_stop_loss": "Structure or 1.5 ATR",
+            "most_similar_historical_stock": "Unavailable",
+            "most_similar_historical_date": "Unavailable",
+        }
+
+    working = trade_log.copy()
+    for column in ["Pattern Detected", "Sector", "Market Regime"]:
+        if column not in working.columns:
+            working[column] = ""
+
+    pattern_mask = working["Pattern Detected"].astype(str).str.contains(pattern.split(" + ")[0], case=False, na=False)
+    sector_mask = working["Sector"].astype(str).str.lower().eq(str(sector).lower()) if sector else pd.Series(False, index=working.index)
+    regime_mask = working["Market Regime"].astype(str).str.lower().eq(str(market_regime).lower())
+    matches = working[pattern_mask | sector_mask | regime_mask].copy()
+    if matches.empty:
+        matches = working.copy()
+
+    pnl = pd.to_numeric(matches.get("Actual Profit/Loss", pd.Series(dtype="float64")), errors="coerce").dropna()
+    if pnl.empty:
+        win_rate = bounded_score(48 + fallback_similarity * 0.35, 100)
+        avg_return = round((win_rate - 50) / 8, 2)
+    else:
+        win_rate = round((pnl > 0).mean() * 100, 2)
+        avg_return = round(float(pnl.mean()), 2)
+
+    holding = pd.to_numeric(matches.get("Holding Time", pd.Series(dtype="float64")), errors="coerce").dropna()
+    holding_days = round(float(holding.mean()), 2) if not holding.empty else "Unavailable"
+    stock_name = matches.get("Stock Name", pd.Series(["Unavailable"])).dropna()
+    trade_date = matches.get("Date", pd.Series(["Unavailable"])).dropna()
+
+    return {
+        "number_of_similar_setups": int(len(matches)),
+        "historical_win_rate": win_rate,
+        "historical_average_return": avg_return,
+        "historical_average_holding_days": holding_days,
+        "best_historical_exit": "Highest expectancy from saved trades" if not pnl.empty else "ATR trailing stop",
+        "best_historical_stop_loss": "Use saved winning-trade stop profile" if not pnl.empty else "Structure or 1.5 ATR",
+        "most_similar_historical_stock": str(stock_name.iloc[-1]) if not stock_name.empty else "Unavailable",
+        "most_similar_historical_date": str(trade_date.iloc[-1]) if not trade_date.empty else "Unavailable",
+    }
+
+
+def score_iq5000_candidate(
+    row: pd.Series,
+    market_regime: dict[str, Any],
+    capital: float,
+    max_risk_pct: float,
+    max_capital_pct: float,
+) -> dict[str, Any]:
+    early = score_ai_early_breakout_candidate(row)
+    if early.get("ai_early_breakout_score", 0) <= 0:
+        return {
+            "ai_iq_score": 0,
+            "nsecode": str(row.get("nsecode") or "").upper(),
+            "reason_for_selection": early.get("reason_for_selection", "Historical data unavailable."),
+        }
+
+    early_score = coerce_float(early.get("ai_early_breakout_score"), 0) or 0
+    smart_money_score = coerce_float(early.get("smart_money_score"), 0) or 0
+    swot_advantage = coerce_float(early.get("swot_advantage"), 0) or 0
+    delivery_pct = coerce_float(early.get("delivery_pct"), 0) or 0
+    turnover_cr = coerce_float(early.get("turnover_cr"), 0) or 0
+    risk_reward = coerce_float(early.get("risk_reward_ratio"), 0) or 0
+    trend_score = coerce_float(early.get("trend_position_score"), 0) or 0
+    breakout_score = coerce_float(early.get("breakout_readiness_score"), 0) or 0
+    compression_score = coerce_float(early.get("compression_score"), 0) or 0
+    relative_strength = coerce_float(early.get("relative_strength_score"), 0) or 0
+    penalties = coerce_float(early.get("penalties"), 0) or 0
+    risk_score_raw = coerce_float(early.get("risk_score"), 0) or 0
+
+    market_score = coerce_float(market_regime.get("market_regime_score"), 60) or 60
+    trend_pct = trend_score / 15 * 100 if trend_score else 0
+    breakout_pct = breakout_score / 20 * 100 if breakout_score else 0
+    compression_pct = compression_score / 15 * 100 if compression_score else 0
+    relative_pct = relative_strength * 10
+    obv_positive = str(early.get("obv_trend", "")).lower() in {"30d high", "rising"}
+    vcp_detected = early.get("vcp_status") == "Detected"
+    darvas_detected = early.get("darvas_box_status") == "Detected"
+    pocket_pivot = early.get("pocket_pivot_status") == "Detected"
+
+    ai_swing_score = bounded_score(
+        trend_pct * 0.35
+        + breakout_pct * 0.25
+        + compression_pct * 0.15
+        + smart_money_score * 0.15
+        + relative_pct * 0.10,
+        100,
+    )
+    ai_intraday_score = bounded_score(
+        35
+        + (20 if turnover_cr >= 50 else 8 if turnover_cr >= 20 else 0)
+        + (15 if pocket_pivot else 0)
+        + (10 if obv_positive else 0)
+        + (10 if market_score >= 70 else 0)
+        + (10 if risk_reward >= 3 else 0),
+        100,
+    )
+    ai_institutional_score = bounded_score(
+        smart_money_score * 0.55
+        + (20 if delivery_pct >= 60 else 14 if delivery_pct >= 55 else 6 if delivery_pct >= 40 else 0)
+        + (10 if obv_positive else 0)
+        + (10 if turnover_cr >= 50 else 0)
+        + (5 if pocket_pivot else 0),
+        100,
+    )
+    fundamental_score = bounded_score(
+        (coerce_float(early.get("fundamental_momentum_score"), 5) or 5) * 10
+        + (15 if swot_advantage >= 25 else 0)
+        + (10 if turnover_cr >= 50 else 0),
+        100,
+    )
+    risk_management_score = bounded_score(
+        risk_score_raw * 10
+        + (15 if risk_reward >= 3 else 0)
+        + (10 if turnover_cr >= 50 else 0)
+        + (10 if delivery_pct >= 55 else 0)
+        - penalties * 2,
+        100,
+    )
+    trade_probability = bounded_score(
+        market_score * 0.10
+        + early_score * 0.25
+        + ai_swing_score * 0.20
+        + ai_institutional_score * 0.20
+        + smart_money_score * 0.10
+        + swot_advantage * 0.10
+        + risk_management_score * 0.05,
+        100,
+    )
+
+    pattern_count = sum([darvas_detected, vcp_detected, pocket_pivot, obv_positive, delivery_pct >= 55])
+    pattern = iq5000_pattern_label(early)
+    similarity_score = bounded_score(40 + pattern_count * 10 + (10 if market_score >= 70 else 0), 100)
+    memory = get_iq5000_memory_estimate(pattern, str(early.get("sector") or ""), str(market_regime.get("market_regime")), similarity_score)
+    historical_win_rate = coerce_float(memory.get("historical_win_rate"), 50) or 50
+    pattern_reliability = bounded_score(45 + pattern_count * 8 + (historical_win_rate - 50) * 0.35, 100)
+    market_memory_score = bounded_score((pattern_reliability + historical_win_rate + market_score + smart_money_score) / 4, 100)
+    market_dna_score = bounded_score(similarity_score * 0.35 + historical_win_rate * 0.25 + market_memory_score * 0.20 + trade_probability * 0.20, 100)
+    ai_confidence = bounded_score(trade_probability * 0.55 + market_dna_score * 0.20 + historical_win_rate * 0.15 + risk_management_score * 0.10, 100)
+
+    weighted_total = (
+        market_score / 100 * IQ5000_MASTER_WEIGHTS["market_regime_score"]
+        + ai_intraday_score / 100 * IQ5000_MASTER_WEIGHTS["ai_intraday_score"]
+        + ai_swing_score / 100 * IQ5000_MASTER_WEIGHTS["ai_swing_score"]
+        + ai_institutional_score / 100 * IQ5000_MASTER_WEIGHTS["ai_institutional_score"]
+        + early_score / 100 * IQ5000_MASTER_WEIGHTS["ai_early_breakout_score"]
+        + smart_money_score / 100 * IQ5000_MASTER_WEIGHTS["smart_money_score"]
+        + swot_advantage / 100 * IQ5000_MASTER_WEIGHTS["swot_advantage_score"]
+        + fundamental_score / 100 * IQ5000_MASTER_WEIGHTS["fundamental_score"]
+        + trade_probability / 100 * IQ5000_MASTER_WEIGHTS["trade_probability"]
+        + risk_management_score / 100 * IQ5000_MASTER_WEIGHTS["risk_management_score"]
+    )
+    ai_iq_score = bounded_score(weighted_total, 1000)
+
+    current_price = coerce_float(early.get("current_price"), 0) or 0
+    breakout_level = coerce_float(early.get("breakout_level"), current_price) or current_price
+    entry_price = breakout_level * 1.001 if breakout_level > current_price else current_price
+    stop_loss = min(entry_price * 0.94, current_price * 0.96) if entry_price else 0
+    per_share_risk = max(entry_price - stop_loss, 0.01)
+    max_rupee_risk = capital * max_risk_pct / 100
+    max_capital_allowed = capital * max_capital_pct / 100
+    risk_size = int(max_rupee_risk / per_share_risk) if per_share_risk else 0
+    capital_size = int(max_capital_allowed / entry_price) if entry_price else 0
+    position_size = max(0, min(risk_size, capital_size))
+    target_1 = entry_price + per_share_risk * 3
+    target_2 = entry_price + per_share_risk * 4
+    target_3 = entry_price + per_share_risk * 5
+    holding_period = "Same day" if ai_intraday_score >= ai_swing_score and ai_intraday_score >= 90 else str(early.get("expected_breakout_window", "1-20 trading sessions"))
+
+    if ai_iq_score >= 950:
+        confidence_rating = "Elite institutional setup"
+    elif ai_iq_score >= 900:
+        confidence_rating = "High conviction"
+    elif ai_iq_score >= 850:
+        confidence_rating = "Strong watchlist"
+    elif ai_iq_score >= 800:
+        confidence_rating = "Monitor closely"
+    else:
+        confidence_rating = "Reject / research only"
+
+    reason_parts = [
+        str(early.get("reason_for_selection", "Setup scored by IQ-5000 model")),
+        f"market regime {market_regime.get('market_regime')} ({market_score}/100)",
+        f"pattern reliability {pattern_reliability}/100",
+        f"market DNA {market_dna_score}/100",
+    ]
+
+    return {
+        "stock_name": early.get("stock_name", row.get("name", "")),
+        "nsecode": early.get("nsecode", row.get("nsecode", "")),
+        "sector": early.get("sector", row.get("sector", "")),
+        "current_price": early.get("current_price"),
+        "ai_iq_score": ai_iq_score,
+        "ai_intraday_score": ai_intraday_score,
+        "ai_swing_score": ai_swing_score,
+        "ai_institutional_score": ai_institutional_score,
+        "ai_early_breakout_score": early_score,
+        "smart_money_score": bounded_score(smart_money_score, 100),
+        "swot_advantage_score": bounded_score(swot_advantage, 100),
+        "fundamental_score": fundamental_score,
+        "trade_probability": trade_probability,
+        "market_regime_score": bounded_score(market_score, 100),
+        "market_regime": market_regime.get("market_regime"),
+        "delivery_pct": round(delivery_pct, 2) if delivery_pct else None,
+        "delivery_trend": early.get("delivery_trend"),
+        "obv_trend": early.get("obv_trend"),
+        "vcp_status": early.get("vcp_status"),
+        "darvas_box_status": early.get("darvas_box_status"),
+        "pocket_pivot_status": early.get("pocket_pivot_status"),
+        "breakout_level": round(breakout_level, 2) if breakout_level else None,
+        "distance_from_breakout_pct": early.get("distance_from_breakout_pct"),
+        "distance_from_ema200_pct": early.get("distance_from_ema200_pct"),
+        "distance_from_sma200_pct": early.get("distance_from_sma200_pct"),
+        "entry_price": round(entry_price, 2) if entry_price else None,
+        "stop_loss": round(stop_loss, 2) if stop_loss else None,
+        "target_1": round(target_1, 2) if entry_price else None,
+        "target_2": round(target_2, 2) if entry_price else None,
+        "target_3": round(target_3, 2) if entry_price else None,
+        "position_size": position_size,
+        "maximum_rupee_risk": round(max_rupee_risk, 2),
+        "capital_required": round(position_size * entry_price, 2) if entry_price else 0,
+        "expected_holding_period": holding_period,
+        "confidence_rating": confidence_rating,
+        "ai_confidence_pct": ai_confidence,
+        "risk_reward_ratio": round(risk_reward, 2),
+        "risk_management_score": risk_management_score,
+        "turnover_cr": round(turnover_cr, 2),
+        "pattern_detected": pattern,
+        "pattern_reliability_score": pattern_reliability,
+        "market_memory_score": market_memory_score,
+        "market_dna_score": market_dna_score,
+        "similarity_score": similarity_score,
+        "number_of_similar_historical_setups": memory.get("number_of_similar_setups"),
+        "historical_win_rate": memory.get("historical_win_rate"),
+        "historical_average_return": memory.get("historical_average_return"),
+        "historical_average_holding_days": memory.get("historical_average_holding_days"),
+        "best_historical_exit": memory.get("best_historical_exit"),
+        "best_historical_stop_loss": memory.get("best_historical_stop_loss"),
+        "most_similar_historical_stock": memory.get("most_similar_historical_stock"),
+        "most_similar_historical_date": memory.get("most_similar_historical_date"),
+        "reason_for_selection": "; ".join(reason_parts),
+    }
+
+
+def build_iq5000_model(
+    df: pd.DataFrame,
+    market_regime: dict[str, Any],
+    capital: float,
+    max_risk_pct: float,
+    max_capital_pct: float,
+    history_limit: int = 100,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    rows: list[dict[str, Any]] = []
+    for _, row in df.head(history_limit).iterrows():
+        scored = score_iq5000_candidate(
+            row,
+            market_regime=market_regime,
+            capital=capital,
+            max_risk_pct=max_risk_pct,
+            max_capital_pct=max_capital_pct,
+        )
+        if scored.get("ai_iq_score", 0) > 0:
+            rows.append(scored)
+
+    model = pd.DataFrame(rows)
+    if model.empty:
+        return model
+    return model.sort_values(["ai_iq_score", "trade_probability", "market_dna_score"], ascending=[False, False, False], kind="mergesort")
+
+
+def apply_iq5000_filters(
+    model: pd.DataFrame,
+    min_iq_score: int,
+    min_market_regime: int,
+    min_module_score: int,
+    min_institutional: int,
+    min_swot: int,
+    min_delivery: int,
+    min_smart_money: int,
+    min_trade_probability: int,
+    min_rr: float,
+    min_turnover: int,
+) -> pd.DataFrame:
+    if model.empty:
+        return model
+
+    filtered = model[
+        (pd.to_numeric(model["ai_iq_score"], errors="coerce") >= min_iq_score)
+        & (pd.to_numeric(model["market_regime_score"], errors="coerce") >= min_market_regime)
+        & (
+            (pd.to_numeric(model["ai_intraday_score"], errors="coerce") >= min_module_score)
+            | (pd.to_numeric(model["ai_swing_score"], errors="coerce") >= min_module_score)
+            | (pd.to_numeric(model["ai_early_breakout_score"], errors="coerce") >= min_module_score)
+        )
+        & (pd.to_numeric(model["ai_institutional_score"], errors="coerce") >= min_institutional)
+        & (pd.to_numeric(model["swot_advantage_score"], errors="coerce") >= min_swot)
+        & (pd.to_numeric(model["delivery_pct"], errors="coerce").fillna(0) >= min_delivery)
+        & (pd.to_numeric(model["smart_money_score"], errors="coerce") >= min_smart_money)
+        & (pd.to_numeric(model["trade_probability"], errors="coerce") >= min_trade_probability)
+        & (pd.to_numeric(model["risk_reward_ratio"], errors="coerce") >= min_rr)
+        & (pd.to_numeric(model["turnover_cr"], errors="coerce").fillna(0) >= min_turnover)
+    ].copy()
+    return filtered.sort_values(["ai_iq_score", "trade_probability", "ai_confidence_pct"], ascending=[False, False, False], kind="mergesort")
+
+
+def iq5000_display_columns(df: pd.DataFrame) -> list[str]:
+    columns = [
+        "stock_name",
+        "nsecode",
+        "sector",
+        "current_price",
+        "ai_iq_score",
+        "ai_intraday_score",
+        "ai_swing_score",
+        "ai_institutional_score",
+        "ai_early_breakout_score",
+        "smart_money_score",
+        "swot_advantage_score",
+        "trade_probability",
+        "market_regime_score",
+        "delivery_pct",
+        "breakout_level",
+        "entry_price",
+        "stop_loss",
+        "target_1",
+        "target_2",
+        "target_3",
+        "position_size",
+        "maximum_rupee_risk",
+        "expected_holding_period",
+        "confidence_rating",
+        "market_memory_score",
+        "market_dna_score",
+        "similarity_score",
+        "historical_win_rate",
+        "risk_reward_ratio",
+        "turnover_cr",
+        "reason_for_selection",
+    ]
+    return [column for column in columns if column in df.columns]
+
+
+def build_iq5000_performance_summary(trade_log: pd.DataFrame) -> pd.DataFrame:
+    if trade_log.empty or "Actual Profit/Loss" not in trade_log.columns:
+        return pd.DataFrame()
+
+    pnl = pd.to_numeric(trade_log["Actual Profit/Loss"], errors="coerce").dropna()
+    if pnl.empty:
+        return pd.DataFrame()
+
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl < 0]
+    profit_factor = wins.sum() / abs(losses.sum()) if not losses.empty and losses.sum() != 0 else None
+    summary = [
+        {"Metric": "Completed Trades", "Value": int(len(pnl))},
+        {"Metric": "Win Rate", "Value": f"{(wins.count() / len(pnl) * 100):.2f}%"},
+        {"Metric": "Loss Rate", "Value": f"{(losses.count() / len(pnl) * 100):.2f}%"},
+        {"Metric": "Average Profit", "Value": round(float(wins.mean()), 2) if not wins.empty else 0},
+        {"Metric": "Average Loss", "Value": round(float(losses.mean()), 2) if not losses.empty else 0},
+        {"Metric": "Profit Factor", "Value": round(float(profit_factor), 2) if profit_factor is not None else "Unavailable"},
+        {"Metric": "Expectancy", "Value": round(float(pnl.mean()), 2)},
+        {"Metric": "Largest Winner", "Value": round(float(pnl.max()), 2)},
+        {"Metric": "Largest Loser", "Value": round(float(pnl.min()), 2)},
+    ]
+    return pd.DataFrame(summary)
+
+
+def build_iq5000_pattern_reliability(trade_log: pd.DataFrame) -> pd.DataFrame:
+    if trade_log.empty or "Pattern Detected" not in trade_log.columns or "Actual Profit/Loss" not in trade_log.columns:
+        return pd.DataFrame()
+
+    working = trade_log.copy()
+    working["pnl"] = pd.to_numeric(working["Actual Profit/Loss"], errors="coerce")
+    working = working.dropna(subset=["pnl"])
+    if working.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        working.groupby("Pattern Detected", dropna=False)
+        .agg(
+            trades=("pnl", "count"),
+            win_rate=("pnl", lambda values: round((values > 0).mean() * 100, 2)),
+            average_pnl=("pnl", "mean"),
+            total_pnl=("pnl", "sum"),
+        )
+        .reset_index()
+    )
+    grouped["average_pnl"] = grouped["average_pnl"].round(2)
+    grouped["total_pnl"] = grouped["total_pnl"].round(2)
+    return grouped.sort_values(["win_rate", "total_pnl"], ascending=[False, False], kind="mergesort")
+
+
+def render_iq5000_learning_console() -> None:
+    initialize_iq5000_memory_state()
+    st.subheader("Self-Learning and Market Memory Console")
+    st.caption("Session-based prototype. Export CSV to preserve data between Streamlit restarts; no SQLite database is added.")
+
+    tab_log, tab_summary, tab_memory = st.tabs(["Trade Database", "Learning Summary", "Market Memory"])
+
+    with tab_log:
+        edited_log = st.data_editor(
+            st.session_state["iq5000_trade_log"],
+            num_rows="dynamic",
+            width="stretch",
+            key="iq5000_trade_log_editor",
+        )
+        if isinstance(edited_log, pd.DataFrame):
+            st.session_state["iq5000_trade_log"] = edited_log
+        st.download_button(
+            "Download trade database CSV",
+            st.session_state["iq5000_trade_log"].to_csv(index=False).encode("utf-8"),
+            file_name="iq5000_trade_database.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    with tab_summary:
+        summary_df = build_iq5000_performance_summary(st.session_state["iq5000_trade_log"])
+        pattern_df = build_iq5000_pattern_reliability(st.session_state["iq5000_trade_log"])
+        if summary_df.empty:
+            st.info("Add completed trades in the Trade Database tab to activate win rate, expectancy, profit factor, and drawdown-style analytics.")
+        else:
+            display_dataframe(summary_df)
+        st.markdown("**Pattern Reliability Engine**")
+        if pattern_df.empty:
+            st.info("Pattern reliability will appear after trades include Pattern Detected and Actual Profit/Loss.")
+        else:
+            display_dataframe(pattern_df)
+
+    with tab_memory:
+        edited_memory = st.data_editor(
+            st.session_state["iq5000_market_memory"],
+            num_rows="dynamic",
+            width="stretch",
+            key="iq5000_market_memory_editor",
+        )
+        if isinstance(edited_memory, pd.DataFrame):
+            st.session_state["iq5000_market_memory"] = edited_memory
+        st.download_button(
+            "Download market memory CSV",
+            st.session_state["iq5000_market_memory"].to_csv(index=False).encode("utf-8"),
+            file_name="iq5000_market_memory.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+
+def render_iq5000_platform_page() -> None:
+    initialize_iq5000_memory_state()
+    st.subheader("IQ-5000 AI Trading Platform")
+    st.caption("Institutional-style decision engine for NSE research: market regime, intraday, swing, smart money, SWOT, probability, risk, and memory scores.")
+
+    with st.sidebar:
+        st.header("IQ-5000 Controls")
+        rows_shown = st.slider("Rows shown", 5, 100, 25, 5, key="iq5000_rows")
+        history_limit = st.slider("Candidates to score", 20, 200, 100, 20, key="iq5000_history_limit")
+        capital = st.number_input("Trading capital", min_value=10_000.0, value=500_000.0, step=50_000.0, key="iq5000_capital")
+        max_risk_pct = st.slider("Max risk per trade %", 0.25, 5.0, 1.0, 0.25, key="iq5000_risk_pct")
+        max_capital_pct = st.slider("Max capital per trade %", 5.0, 100.0, 25.0, 5.0, key="iq5000_capital_pct")
+        st.divider()
+        min_iq_score = st.slider("Minimum AI IQ score", 0, 1000, 900, 10, key="iq5000_min_iq")
+        min_market_regime = st.slider("Minimum market regime score", 0, 100, 70, 1, key="iq5000_min_market")
+        min_module_score = st.slider("Minimum intraday/swing/early score", 0, 100, 90, 1, key="iq5000_min_module")
+        min_institutional = st.slider("Minimum institutional score", 0, 100, 85, 1, key="iq5000_min_inst")
+        min_swot = st.slider("Minimum SWOT advantage", 0, 100, 25, 1, key="iq5000_min_swot")
+        min_delivery = st.slider("Minimum delivery %", 0, 100, 55, 1, key="iq5000_min_delivery")
+        min_smart_money = st.slider("Minimum smart money score", 0, 100, 75, 1, key="iq5000_min_smart")
+        min_trade_probability = st.slider("Minimum trade probability", 0, 100, 90, 1, key="iq5000_min_probability")
+        min_rr = st.slider("Minimum risk/reward", 1.0, 5.0, 3.0, 0.25, key="iq5000_min_rr")
+        min_turnover = st.slider("Minimum turnover crore", 0, 250, 50, 5, key="iq5000_min_turnover")
+        if st.button("Refresh IQ-5000", type="primary", width="stretch"):
+            run_scan.clear()
+            fetch_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            compute_iq5000_market_regime.clear()
+            st.rerun()
+
+    market_regime = compute_iq5000_market_regime()
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Market Regime", str(market_regime.get("market_regime")))
+    metric_b.metric("Regime Score", int(market_regime.get("market_regime_score", 0)))
+    metric_c.metric("Master Weight", "1000 pts")
+
+    with st.expander("Market Regime AI details"):
+        display_dataframe(pd.DataFrame(market_regime.get("details", [])))
+
+    with st.spinner("Fetching and scoring IQ-5000 candidates..."):
+        df, error = run_scan(AI_EARLY_BREAKOUT_CLAUSE)
+    if error:
+        st.error(error)
+        st.caption("If Chartink rejects the pre-filter, adjust AI_EARLY_BREAKOUT_CLAUSE.")
+        render_iq5000_learning_console()
+        return
+
+    model = build_iq5000_model(
+        df,
+        market_regime=market_regime,
+        capital=capital,
+        max_risk_pct=max_risk_pct,
+        max_capital_pct=max_capital_pct,
+        history_limit=history_limit,
+    )
+    if model.empty:
+        st.info("No candidates returned by the IQ-5000 pre-filter or historical scoring engine.")
+        render_iq5000_learning_console()
+        return
+
+    filtered = apply_iq5000_filters(
+        model,
+        min_iq_score=min_iq_score,
+        min_market_regime=min_market_regime,
+        min_module_score=min_module_score,
+        min_institutional=min_institutional,
+        min_swot=min_swot,
+        min_delivery=min_delivery,
+        min_smart_money=min_smart_money,
+        min_trade_probability=min_trade_probability,
+        min_rr=min_rr,
+        min_turnover=min_turnover,
+    )
+
+    metric_d, metric_e, metric_f = st.columns(3)
+    metric_d.metric("Scored Candidates", len(model))
+    metric_e.metric("Final Qualified", len(filtered))
+    metric_f.metric("Top AI IQ", int((filtered if not filtered.empty else model).iloc[0]["ai_iq_score"]))
+
+    if filtered.empty:
+        st.error("NO TRADE TODAY - CAPITAL PRESERVATION HAS THE HIGHEST EXPECTED VALUE.")
+        st.caption("Loosen the sidebar controls to inspect near-miss setups, or review the full scored universe below.")
+    else:
+        st.subheader("Top 10 IQ-5000 Opportunities")
+        top10 = filtered.head(10)
+        display_dataframe(top10[iq5000_display_columns(top10)], height=560)
+        st.download_button(
+            "Download IQ-5000 final candidates CSV",
+            top10.to_csv(index=False).encode("utf-8"),
+            file_name="iq5000_final_candidates.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    with st.expander("Scored universe before final IQ-5000 filters", expanded=filtered.empty):
+        display_dataframe(model[iq5000_display_columns(model)].head(rows_shown), height=560)
+
+    with st.expander("Master score weights"):
+        weights_df = pd.DataFrame(
+            [{"Module": key.replace("_", " ").title(), "Weight": value} for key, value in IQ5000_MASTER_WEIGHTS.items()]
+        )
+        display_dataframe(weights_df)
+
+    render_iq5000_learning_console()
+
+
 def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("High Accuracy Candidates")
@@ -3436,7 +4177,7 @@ def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
             )
             return
 
-        st.dataframe(high_accuracy_df, width="stretch", hide_index=True, height=420)
+        display_dataframe(high_accuracy_df, height=420)
         st.download_button(
             "Download high accuracy candidates CSV",
             high_accuracy_df.to_csv(index=False).encode("utf-8"),
@@ -3459,6 +4200,9 @@ def main() -> None:
         return
     if selected_page == "Hedge Fund Stock Picker":
         render_hedge_fund_model_page()
+        return
+    if selected_page == "IQ-5000 AI Platform":
+        render_iq5000_platform_page()
         return
     if selected_page == "AI Early Breakout Score":
         render_ai_early_breakout_page()
