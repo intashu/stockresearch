@@ -382,6 +382,15 @@ LAUNCH_PAD_200_CLAUSE = (
     "and latest close * latest volume > 100000000 "
     "and latest close >= 20 ) )"
 )
+AI_EARLY_BREAKOUT_CLAUSE = (
+    "( {cash} ( latest close > latest ema ( close,50 ) "
+    "and latest close > latest ema ( close,100 ) "
+    "and latest close <= latest max ( 120 , latest high ) * 1.08 "
+    "and latest close >= latest max ( 252 , latest high ) * 0.90 "
+    "and latest volume > latest sma ( volume,20 ) * 0.8 "
+    "and latest close * latest volume > 500000000 "
+    "and latest close >= 50 ) )"
+)
 
 INSTITUTIONAL_RULES = [
     "EMA20 > EMA50 > EMA100",
@@ -896,6 +905,7 @@ def sidebar_page_choice() -> str:
                 "Institutional Breakout Setup",
                 "Breakout Probability Model",
                 "Hedge Fund Stock Picker",
+                "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
             ],
@@ -3127,6 +3137,291 @@ def render_launch_pad_200_page() -> None:
         display_dataframe(model.head(rows_shown), height=520)
 
 
+def score_ai_early_breakout_candidate(row: pd.Series) -> dict[str, Any]:
+    symbol = str(row.get("nsecode") or "").strip().upper()
+    history = fetch_ohlcv_history(symbol)
+    if history.empty or len(history) < 220 or not {"close", "high", "low", "volume"}.issubset(history.columns):
+        return {"ai_early_breakout_score": 0, "reason_for_selection": "Historical OHLCV unavailable or insufficient."}
+
+    close = pd.to_numeric(history["close"], errors="coerce").dropna()
+    high = pd.to_numeric(history["high"], errors="coerce").dropna()
+    low = pd.to_numeric(history["low"], errors="coerce").dropna()
+    volume = pd.to_numeric(history["volume"], errors="coerce").dropna()
+    if len(close) < 220 or len(volume) < 60:
+        return {"ai_early_breakout_score": 0, "reason_for_selection": "Not enough clean historical rows."}
+
+    current_price = float(close.iloc[-1])
+    previous_close = close.shift(1)
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    ema190 = close.ewm(span=190, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    sma190 = close.rolling(190).mean()
+    sma200 = close.rolling(200).mean()
+    latest_ema200 = float(ema200.iloc[-1])
+    latest_sma200 = float(sma200.iloc[-1])
+    distance_ema200 = (latest_ema200 - current_price) / latest_ema200 * 100 if latest_ema200 else None
+    distance_sma200 = (latest_sma200 - current_price) / latest_sma200 * 100 if latest_sma200 else None
+
+    true_range = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+    atr14 = true_range.rolling(14).mean()
+    range_pct = (high - low) / close
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    bb_width = ((bb_mid + 2 * bb_std) - (bb_mid - 2 * bb_std)) / bb_mid
+    rsi_delta = close.diff()
+    rsi_gain = rsi_delta.clip(lower=0).rolling(14).mean()
+    rsi_loss = (-rsi_delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + (rsi_gain / rsi_loss)))
+    latest_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
+
+    direction = close.diff().fillna(0).apply(lambda value: 1 if value > 0 else -1 if value < 0 else 0)
+    obv = (direction * volume.fillna(0)).cumsum()
+    obv_30d_high = bool(obv.iloc[-1] >= obv.tail(30).max())
+    obv_slope_up = bool(obv.iloc[-1] > obv.shift(10).iloc[-1])
+    down_volume = volume.where(close < previous_close, 0)
+    pocket_pivot = bool(volume.iloc[-1] > down_volume.shift(1).rolling(10).max().iloc[-1] and close.iloc[-1] > previous_close.iloc[-1])
+
+    breakout_level = float(max(high.tail(55).max(), high.tail(20).max()))
+    high_52w = float(high.tail(252).max())
+    distance_breakout = (breakout_level - current_price) / breakout_level * 100 if breakout_level else None
+    distance_52w = (high_52w - current_price) / high_52w * 100 if high_52w else None
+    higher_lows = bool(low.tail(20).min() > low.shift(20).tail(20).min())
+    darvas_detected = bool(distance_breakout is not None and 0 <= distance_breakout <= 3)
+    vcp_detected = bool(
+        pd.notna(atr14.shift(5).iloc[-1])
+        and atr14.iloc[-1] < atr14.shift(5).iloc[-1]
+        and bb_width.iloc[-1] <= bb_width.tail(120).quantile(0.20)
+        and range_pct.tail(5).mean() < range_pct.shift(5).tail(5).mean()
+    )
+    nr7 = bool((high.iloc[-1] - low.iloc[-1]) <= (high - low).tail(7).min())
+    inside_cluster = bool((high.tail(3).max() <= high.shift(3).tail(3).max()) and (low.tail(3).min() >= low.shift(3).tail(3).min()))
+
+    delivery_snapshot = fetch_nse_delivery_snapshot(symbol)
+    delivery_pct = delivery_snapshot.get("delivery_percentage")
+    if (delivery_pct is None or pd.isna(delivery_pct)) and delivery_snapshot.get("delivery_quantity") and delivery_snapshot.get("traded_quantity"):
+        delivery_pct = delivery_snapshot["delivery_quantity"] / delivery_snapshot["traded_quantity"] * 100
+
+    latest_volume = float(volume.iloc[-1])
+    avg_volume_20 = float(volume.tail(20).mean())
+    volume_ratio = latest_volume / avg_volume_20 if avg_volume_20 else 0
+    turnover_cr = current_price * latest_volume / 10_000_000
+    gap_up = (current_price - float(previous_close.iloc[-1])) / float(previous_close.iloc[-1]) * 100 if previous_close.iloc[-1] else 0
+
+    stock_return_20 = close.iloc[-1] / close.iloc[-21] - 1 if len(close) > 21 else 0
+    nifty = fetch_ohlcv_history("^NSEI")
+    sector_underperforming = False
+    rs_vs_nifty = None
+    if not nifty.empty and "close" in nifty.columns:
+        nifty_close = pd.to_numeric(nifty["close"], errors="coerce").dropna()
+        if len(nifty_close) > 21:
+            nifty_return_20 = nifty_close.iloc[-1] / nifty_close.iloc[-21] - 1
+            rs_vs_nifty = (stock_return_20 - nifty_return_20) * 100
+            sector_underperforming = rs_vs_nifty < 0
+
+    trend_position = 0
+    trend_position += 2 if current_price > ema50.iloc[-1] else 0
+    trend_position += 2 if current_price > ema100.iloc[-1] else 0
+    trend_position += 2 if current_price >= ema190.iloc[-1] or (distance_ema200 is not None and 0 <= distance_ema200 <= 3) else 0
+    trend_position += 2 if current_price >= sma190.iloc[-1] or (distance_sma200 is not None and 0 <= distance_sma200 <= 3) else 0
+    trend_position += 2 if ema20.iloc[-1] > ema50.iloc[-1] else 0
+    trend_position += 2 if ema50.iloc[-1] > ema50.shift(5).iloc[-1] else 0
+    trend_position += 2 if ema100.iloc[-1] > ema100.shift(5).iloc[-1] else 0
+    trend_position += 1 if ema200.iloc[-1] >= ema200.shift(10).iloc[-1] * 0.995 else 0
+    trend_position = bounded_score(trend_position, 15)
+
+    breakout_readiness = 0
+    breakout_readiness += 5 if darvas_detected else 0
+    breakout_readiness += 3 if distance_52w is not None and 0 <= distance_52w <= 3 else 0
+    breakout_readiness += 3 if higher_lows else 0
+    breakout_readiness += 3 if distance_breakout is not None and 0 <= distance_breakout <= 3 else 0
+    breakout_readiness += 3 if close.tail(20).max() <= high.tail(55).max() * 1.01 else 0
+    breakout_readiness += 3 if distance_breakout is not None and distance_breakout >= 0 else 0
+    breakout_readiness = bounded_score(breakout_readiness, 20)
+
+    compression = 0
+    compression += 5 if vcp_detected else 0
+    compression += 3 if pd.notna(atr14.shift(5).iloc[-1]) and atr14.iloc[-1] < atr14.shift(5).iloc[-1] else 0
+    compression += 3 if bb_width.iloc[-1] <= bb_width.tail(120).quantile(0.20) else 0
+    compression += 2 if nr7 else 0
+    compression += 1 if inside_cluster else 0
+    compression += 1 if range_pct.tail(5).mean() < range_pct.shift(5).tail(5).mean() else 0
+    compression = bounded_score(compression, 15)
+
+    smart_money_raw = 0
+    smart_money_raw += 20 if delivery_pct is not None and delivery_pct >= 60 else 12 if delivery_pct is not None and delivery_pct >= 55 else 5
+    smart_money_raw += 20 if obv_30d_high else 10 if obv_slope_up else 0
+    smart_money_raw += 10 if volume_ratio >= 1.2 else 5 if volume_ratio >= 0.8 else 0
+    smart_money = bounded_score(smart_money_raw / 50 * 20, 20)
+    smart_money_percent = bounded_score(smart_money_raw * 2, 100)
+
+    relative_strength = bounded_score((5 if rs_vs_nifty is not None and rs_vs_nifty > 0 else 0) + (3 if stock_return_20 > 0 else 0) + (2 if distance_52w is not None and 0 <= distance_52w <= 3 else 0), 10)
+    fundamental = 5
+    risk = 10
+    penalties = 0
+    if latest_rsi is not None and latest_rsi > 80:
+        penalties += 5
+        risk -= 2
+    if distance_breakout is not None and distance_breakout < -8:
+        penalties += 5
+        risk -= 3
+    if delivery_pct is not None and delivery_pct < 40:
+        penalties += 5
+        risk -= 2
+    if sector_underperforming:
+        penalties += 5
+        risk -= 2
+    if turnover_cr < 50:
+        risk -= 3
+    if gap_up > 5:
+        penalties += 5
+        risk -= 2
+    risk = bounded_score(risk, 10)
+
+    bonus = min(10, (2 if vcp_detected else 0) + (2 if darvas_detected else 0) + (2 if pocket_pivot else 0) + (2 if delivery_pct is not None and delivery_pct > 60 else 0) + (2 if obv_30d_high else 0))
+    ai_score = bounded_score(trend_position + breakout_readiness + compression + smart_money + relative_strength + fundamental + risk + bonus - penalties, 100)
+    swot_advantage = bounded_score((trend_position + breakout_readiness + compression + smart_money + relative_strength) - max(0, 10 - risk) - penalties, 100)
+    risk_reward = 3.5 if distance_breakout is not None and 0 <= distance_breakout <= 3 and risk >= 7 else 2.5 if risk >= 5 else 1.5
+
+    if ai_score >= 96:
+        classification, window, confidence = "Rare Institutional Setup", "1-3 trading sessions", 96
+    elif ai_score >= 91:
+        classification, window, confidence = "Elite Early Breakout", "2-5 trading sessions", 92
+    elif ai_score >= 86:
+        classification, window, confidence = "High Probability Watchlist", "3-5 trading sessions", 88
+    elif ai_score >= 80:
+        classification, window, confidence = "Monitor Closely", "5+ trading sessions", 82
+    else:
+        classification, window, confidence = "Reject", "No near-term setup", ai_score
+
+    reasons = []
+    if darvas_detected:
+        reasons.append("near Darvas/resistance breakout level")
+    if vcp_detected:
+        reasons.append("volatility compression detected")
+    if obv_30d_high:
+        reasons.append("OBV at 30-day high")
+    if delivery_pct is not None:
+        reasons.append(f"delivery {delivery_pct:.2f}%")
+    if rs_vs_nifty is not None:
+        reasons.append(f"20D RS vs Nifty {rs_vs_nifty:.2f}%")
+
+    return {
+        "stock_name": row.get("name", symbol),
+        "nsecode": symbol,
+        "sector": row.get("sector", ""),
+        "current_price": round(current_price, 2),
+        "ai_early_breakout_score": ai_score,
+        "classification": classification,
+        "expected_breakout_window": window,
+        "breakout_level": round(float(breakout_level), 2),
+        "distance_from_breakout_pct": round(distance_breakout, 2) if distance_breakout is not None else None,
+        "distance_from_ema200_pct": round(distance_ema200, 2) if distance_ema200 is not None else None,
+        "distance_from_sma200_pct": round(distance_sma200, 2) if distance_sma200 is not None else None,
+        "delivery_pct": round(delivery_pct, 2) if delivery_pct is not None and pd.notna(delivery_pct) else None,
+        "delivery_trend": "Strong" if delivery_pct is not None and delivery_pct >= 60 else "Positive" if delivery_pct is not None and delivery_pct >= 55 else "Unavailable/weak",
+        "obv_trend": "30D high" if obv_30d_high else "Rising" if obv_slope_up else "Not confirmed",
+        "vcp_status": "Detected" if vcp_detected else "Not detected",
+        "darvas_box_status": "Detected" if darvas_detected else "Not detected",
+        "pocket_pivot_status": "Detected" if pocket_pivot else "Not detected",
+        "risk_reward_ratio": round(risk_reward, 2),
+        "confidence_pct": confidence,
+        "trend_position_score": trend_position,
+        "breakout_readiness_score": breakout_readiness,
+        "compression_score": compression,
+        "smart_money_score": smart_money_percent,
+        "relative_strength_score": relative_strength,
+        "fundamental_momentum_score": fundamental,
+        "risk_score": risk,
+        "bonus_points": bonus,
+        "penalties": penalties,
+        "swot_advantage": swot_advantage,
+        "turnover_cr": round(turnover_cr, 2),
+        "reason_for_selection": "; ".join(reasons) if reasons else "Setup not mature yet",
+    }
+
+
+def build_ai_early_breakout_model(df: pd.DataFrame, history_limit: int = 120) -> pd.DataFrame:
+    if df.empty:
+        return df
+    rows = []
+    for _, row in df.head(history_limit).iterrows():
+        scored = score_ai_early_breakout_candidate(row)
+        if scored.get("ai_early_breakout_score", 0) > 0:
+            rows.append(scored)
+    model = pd.DataFrame(rows)
+    if model.empty:
+        return model
+    return model.sort_values(["ai_early_breakout_score", "confidence_pct", "risk_reward_ratio"], ascending=[False, False, False], kind="mergesort")
+
+
+def render_ai_early_breakout_page() -> None:
+    st.subheader("AI Early Breakout Score")
+    st.caption("Ranks NSE stocks preparing for a potential breakout in the next 1-5 sessions without chasing extended breakouts.")
+
+    with st.sidebar:
+        st.header("AI Early Breakout Controls")
+        rows_shown = st.slider("Rows shown", 5, 100, 25, 5, key="ai_early_rows")
+        history_limit = st.slider("Candidates to score", 20, 200, 120, 20, key="ai_early_history")
+        st.divider()
+        min_score = st.slider("Minimum AI score", 0, 100, 90, 1, key="ai_early_min_score")
+        min_delivery = st.slider("Minimum delivery %", 0, 100, 55, 1, key="ai_early_min_delivery")
+        min_smart_money = st.slider("Minimum smart money score", 0, 100, 75, 1, key="ai_early_min_smart")
+        min_swot_advantage = st.slider("Minimum SWOT advantage", 0, 100, 25, 1, key="ai_early_min_swot")
+        min_rr = st.slider("Minimum risk/reward", 1.0, 5.0, 3.0, 0.25, key="ai_early_min_rr")
+        min_turnover = st.slider("Minimum turnover crore", 0, 200, 50, 5, key="ai_early_min_turnover")
+        if st.button("Refresh AI early breakout", type="primary", width="stretch"):
+            run_scan.clear()
+            fetch_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            st.rerun()
+
+    with st.spinner("Fetching AI early breakout candidates..."):
+        df, error = run_scan(AI_EARLY_BREAKOUT_CLAUSE)
+    if error:
+        st.error(error)
+        st.caption("If Chartink rejects the pre-filter, adjust AI_EARLY_BREAKOUT_CLAUSE.")
+        return
+
+    model = build_ai_early_breakout_model(df, history_limit=history_limit)
+    if model.empty:
+        st.info("No candidates returned by the AI early breakout pre-filter or scoring engine.")
+        return
+
+    filtered = model[
+        (pd.to_numeric(model["ai_early_breakout_score"], errors="coerce") >= min_score)
+        & (pd.to_numeric(model["delivery_pct"], errors="coerce").fillna(0) >= min_delivery)
+        & (pd.to_numeric(model["smart_money_score"], errors="coerce") >= min_smart_money)
+        & (pd.to_numeric(model["swot_advantage"], errors="coerce") >= min_swot_advantage)
+        & (pd.to_numeric(model["risk_reward_ratio"], errors="coerce") >= min_rr)
+        & (pd.to_numeric(model["turnover_cr"], errors="coerce") >= min_turnover)
+        & (model["expected_breakout_window"].astype(str).str.contains("1-3|2-5|3-5", regex=True))
+    ].copy()
+    filtered = filtered.sort_values(["ai_early_breakout_score", "confidence_pct"], ascending=[False, False], kind="mergesort")
+
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Scored candidates", len(model))
+    metric_b.metric("Filtered candidates", len(filtered))
+    metric_c.metric("Top AI score", int((filtered if not filtered.empty else model).iloc[0]["ai_early_breakout_score"]))
+
+    if filtered.empty:
+        st.warning("No stocks pass the current strict final filter. Loosen sidebar filters or review the scored universe below.")
+    else:
+        st.subheader("AI Early Breakout Candidates")
+        display_dataframe(filtered.head(rows_shown), height=560)
+        st.download_button(
+            "Download AI early breakout candidates CSV",
+            filtered.to_csv(index=False).encode("utf-8"),
+            file_name="ai_early_breakout_candidates.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    with st.expander("Scored universe before final filters", expanded=filtered.empty):
+        display_dataframe(model.head(rows_shown), height=560)
+
+
 def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("High Accuracy Candidates")
@@ -3164,6 +3459,9 @@ def main() -> None:
         return
     if selected_page == "Hedge Fund Stock Picker":
         render_hedge_fund_model_page()
+        return
+    if selected_page == "AI Early Breakout Score":
+        render_ai_early_breakout_page()
         return
     if selected_page == "200 EMA/SMA Launch Pad":
         render_launch_pad_200_page()
