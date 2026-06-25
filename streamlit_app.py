@@ -1357,6 +1357,35 @@ def coerce_float(value: Any, default: float | None = None) -> float | None:
     return float(number)
 
 
+def safe_sort_dataframe(
+    df: pd.DataFrame,
+    columns: list[str],
+    ascending: list[bool] | bool,
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    available = [column for column in columns if column in df.columns]
+    if not available:
+        return df
+
+    sortable = df.copy()
+    for column in available:
+        numeric = pd.to_numeric(sortable[column], errors="coerce")
+        if numeric.notna().any():
+            sortable[column] = numeric
+
+    if isinstance(ascending, list):
+        available_ascending = [ascending[columns.index(column)] for column in available]
+    else:
+        available_ascending = ascending
+
+    try:
+        return sortable.sort_values(available, ascending=available_ascending, kind="mergesort")
+    except Exception:
+        return df
+
+
 def normalize_ohlcv_columns(history: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
         return history
@@ -3441,6 +3470,7 @@ def score_ai_early_breakout_candidate(row: pd.Series) -> dict[str, Any]:
         "turnover_cr": round(turnover_cr, 2),
         "reason_for_selection": "; ".join(reasons) if reasons else "Setup not mature yet",
     }
+    return candidate
 
 
 def build_ai_early_breakout_model(df: pd.DataFrame, history_limit: int = 120) -> pd.DataFrame:
@@ -3448,13 +3478,20 @@ def build_ai_early_breakout_model(df: pd.DataFrame, history_limit: int = 120) ->
         return df
     rows = []
     for _, row in df.head(history_limit).iterrows():
-        scored = score_ai_early_breakout_candidate(row)
-        if scored.get("ai_early_breakout_score", 0) > 0:
+        try:
+            scored = score_ai_early_breakout_candidate(row)
+        except Exception as exc:
+            scored = {
+                "ai_early_breakout_score": 0,
+                "nsecode": row.get("nsecode", ""),
+                "reason_for_selection": f"Scoring skipped: {exc}",
+            }
+        if isinstance(scored, dict) and coerce_float(scored.get("ai_early_breakout_score"), 0) and coerce_float(scored.get("ai_early_breakout_score"), 0) > 0:
             rows.append(scored)
     model = pd.DataFrame(rows)
     if model.empty:
         return model
-    return model.sort_values(["ai_early_breakout_score", "confidence_pct", "risk_reward_ratio"], ascending=[False, False, False], kind="mergesort")
+    return safe_sort_dataframe(model, ["ai_early_breakout_score", "confidence_pct", "risk_reward_ratio"], [False, False, False])
 
 
 def render_ai_early_breakout_page() -> None:
@@ -3677,8 +3714,19 @@ def score_iq5000_candidate(
     max_risk_pct: float,
     max_capital_pct: float,
 ) -> dict[str, Any]:
-    early = score_ai_early_breakout_candidate(row)
-    if early.get("ai_early_breakout_score", 0) <= 0:
+    try:
+        early = score_ai_early_breakout_candidate(row)
+    except Exception as exc:
+        early = {
+            "ai_early_breakout_score": 0,
+            "reason_for_selection": f"Early breakout scoring failed: {exc}",
+        }
+    if not isinstance(early, dict):
+        early = {
+            "ai_early_breakout_score": 0,
+            "reason_for_selection": "Early breakout scorer returned no usable data.",
+        }
+    if (coerce_float(early.get("ai_early_breakout_score"), 0) or 0) <= 0:
         return {
             "ai_iq_score": 0,
             "nsecode": str(row.get("nsecode") or "").upper(),
@@ -3885,20 +3933,27 @@ def build_iq5000_model(
 
     rows: list[dict[str, Any]] = []
     for _, row in df.head(history_limit).iterrows():
-        scored = score_iq5000_candidate(
-            row,
-            market_regime=market_regime,
-            capital=capital,
-            max_risk_pct=max_risk_pct,
-            max_capital_pct=max_capital_pct,
-        )
-        if scored.get("ai_iq_score", 0) > 0:
+        try:
+            scored = score_iq5000_candidate(
+                row,
+                market_regime=market_regime,
+                capital=capital,
+                max_risk_pct=max_risk_pct,
+                max_capital_pct=max_capital_pct,
+            )
+        except Exception as exc:
+            scored = {
+                "ai_iq_score": 0,
+                "nsecode": row.get("nsecode", ""),
+                "reason_for_selection": f"IQ-5000 scoring skipped: {exc}",
+            }
+        if isinstance(scored, dict) and (coerce_float(scored.get("ai_iq_score"), 0) or 0) > 0:
             rows.append(scored)
 
     model = pd.DataFrame(rows)
     if model.empty:
         return model
-    return model.sort_values(["ai_iq_score", "trade_probability", "market_dna_score"], ascending=[False, False, False], kind="mergesort")
+    return safe_sort_dataframe(model, ["ai_iq_score", "trade_probability", "market_dna_score"], [False, False, False])
 
 
 def apply_iq5000_filters(
@@ -4710,16 +4765,23 @@ def build_ai_overnight_model(df: pd.DataFrame, market_regime: dict[str, Any], hi
         return df
     rows: list[dict[str, Any]] = []
     for _, row in df.head(history_limit).iterrows():
-        scored = score_ai_overnight_candidate(row, market_regime)
-        if scored.get("tomorrow_intraday_probability", 0) > 0:
+        try:
+            scored = score_ai_overnight_candidate(row, market_regime)
+        except Exception as exc:
+            scored = {
+                "tomorrow_intraday_probability": 0,
+                "nsecode": row.get("nsecode", ""),
+                "reason_for_selection": f"Overnight scoring skipped: {exc}",
+            }
+        if isinstance(scored, dict) and (coerce_float(scored.get("tomorrow_intraday_probability"), 0) or 0) > 0:
             rows.append(scored)
     model = pd.DataFrame(rows)
     if model.empty:
         return model
-    return model.sort_values(
+    return safe_sort_dataframe(
+        model,
         ["similarity_based_probability", "module16_consensus_score", "tomorrow_intraday_probability"],
-        ascending=[False, False, False],
-        kind="mergesort",
+        [False, False, False],
     )
 
 
