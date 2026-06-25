@@ -391,6 +391,26 @@ AI_EARLY_BREAKOUT_CLAUSE = (
     "and latest close * latest volume > 500000000 "
     "and latest close >= 50 ) )"
 )
+AI_OVERNIGHT_OPPORTUNITY_CLAUSE = (
+    "( {cash} ( latest close > latest ema ( close,20 ) "
+    "and latest close > latest ema ( close,50 ) "
+    "and latest volume > latest sma ( volume,20 ) * 0.8 "
+    "and latest close * latest volume > 200000000 "
+    "and latest close >= 50 ) )"
+)
+
+OVERNIGHT_SCORE_WEIGHTS = {
+    "closing_strength_score": 15,
+    "closing_auction_score": 10,
+    "delivery_score": 15,
+    "volume_profile_score": 15,
+    "relative_strength_score": 10,
+    "options_score": 5,
+    "compression_score": 10,
+    "news_catalyst_score": 5,
+    "historical_behaviour_score": 5,
+    "liquidity_score": 10,
+}
 
 IQ5000_MASTER_WEIGHTS = {
     "market_regime_score": 100,
@@ -975,6 +995,7 @@ def sidebar_page_choice() -> str:
                 "Breakout Probability Model",
                 "Hedge Fund Stock Picker",
                 "IQ-5000 AI Trading Platform",
+                "AI Overnight Opportunity",
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
@@ -4163,6 +4184,465 @@ def render_iq5000_platform_page() -> None:
     render_iq5000_learning_console()
 
 
+def classify_overnight_watchlist(probability: float) -> tuple[str, str]:
+    if probability >= 96:
+        return "Elite Tomorrow Candidate", "Expected probability > 80%"
+    if probability >= 91:
+        return "Very High Probability", "Confirm at open"
+    if probability >= 86:
+        return "High Probability", "Strong watchlist"
+    if probability >= 80:
+        return "Watchlist", "Needs live confirmation"
+    return "Reject", "Below overnight threshold"
+
+
+def overnight_best_entry_window(
+    closing_strength_score: int,
+    volume_profile_score: int,
+    compression_score: int,
+    gap_up_probability: int,
+) -> str:
+    if gap_up_probability >= 75 and volume_profile_score >= 75:
+        return "09:20-09:35"
+    if closing_strength_score >= 80 and compression_score >= 70:
+        return "09:35-10:00"
+    if volume_profile_score >= 85:
+        return "09:15-09:20 only after VWAP hold"
+    if compression_score >= 80:
+        return "10:00-10:30"
+    return "After opening range confirmation"
+
+
+def score_ai_overnight_candidate(row: pd.Series, market_regime: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(row.get("nsecode") or "").strip().upper()
+    history = fetch_ohlcv_history(symbol)
+    if history.empty or len(history) < 120 or not {"close", "high", "low", "open", "volume"}.issubset(history.columns):
+        return {"tomorrow_intraday_probability": 0, "nsecode": symbol, "reason_for_selection": "Historical EOD OHLCV unavailable or insufficient."}
+
+    close = pd.to_numeric(history["close"], errors="coerce").dropna()
+    high = pd.to_numeric(history["high"], errors="coerce").dropna()
+    low = pd.to_numeric(history["low"], errors="coerce").dropna()
+    open_price = pd.to_numeric(history["open"], errors="coerce").dropna()
+    volume = pd.to_numeric(history["volume"], errors="coerce").dropna()
+    if min(len(close), len(high), len(low), len(open_price), len(volume)) < 120:
+        return {"tomorrow_intraday_probability": 0, "nsecode": symbol, "reason_for_selection": "Not enough clean EOD rows."}
+
+    current_price = float(close.iloc[-1])
+    latest_open = float(open_price.iloc[-1])
+    latest_high = float(high.iloc[-1])
+    latest_low = float(low.iloc[-1])
+    day_range = max(latest_high - latest_low, 0.01)
+    closing_position = (current_price - latest_low) / day_range * 100
+    body_pct = abs(current_price - latest_open) / day_range * 100
+    bullish_close = current_price > latest_open
+    bullish_engulfing = bool(current_price > open_price.shift(1).iloc[-1] and latest_open < close.shift(1).iloc[-1] and bullish_close)
+    marubozu_proxy = bool(closing_position >= 85 and body_pct >= 65)
+    nr7 = bool((high.iloc[-1] - low.iloc[-1]) <= (high - low).tail(7).min())
+    inside_day = bool(latest_high <= high.shift(1).iloc[-1] and latest_low >= low.shift(1).iloc[-1])
+    higher_high = bool(latest_high > high.shift(1).iloc[-1])
+    higher_low = bool(latest_low > low.shift(1).iloc[-1])
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    previous_close = close.shift(1)
+    true_range = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+    atr14 = true_range.rolling(14).mean()
+    atr_pct = float(atr14.iloc[-1] / current_price * 100) if pd.notna(atr14.iloc[-1]) and current_price else 0
+    daily_range_pct = float((high.iloc[-1] - low.iloc[-1]) / current_price * 100) if current_price else 0
+    vwap_proxy = float(((high + low + close) / 3).iloc[-1])
+
+    closing_strength_score = 0
+    closing_strength_score += min(35, closing_position * 0.35)
+    closing_strength_score += 10 if current_price > vwap_proxy else 0
+    closing_strength_score += 10 if current_price > ema20.iloc[-1] else 0
+    closing_strength_score += 10 if current_price > ema50.iloc[-1] else 0
+    closing_strength_score += 8 if current_price > ema100.iloc[-1] else 0
+    closing_strength_score += 8 if bullish_close else 0
+    closing_strength_score += 6 if bullish_engulfing else 0
+    closing_strength_score += 5 if marubozu_proxy else 0
+    closing_strength_score += 4 if nr7 or inside_day else 0
+    closing_strength_score += 4 if higher_high and higher_low else 0
+    closing_strength_score = bounded_score(closing_strength_score, 100)
+
+    latest_volume = float(volume.iloc[-1])
+    avg_volume_20 = float(volume.tail(20).mean())
+    avg_volume_50 = float(volume.tail(50).mean())
+    volume_ratio = latest_volume / avg_volume_20 if avg_volume_20 else 0
+    turnover_cr = current_price * latest_volume / 10_000_000 if current_price else 0
+    volume_dryup = bool(volume.shift(1).tail(5).mean() < volume.shift(6).tail(20).mean() * 0.8) if len(volume) > 30 else False
+    down_volume = volume.where(close < previous_close, 0)
+    pocket_pivot = bool(volume.iloc[-1] > down_volume.shift(1).rolling(10).max().iloc[-1] and current_price > previous_close.iloc[-1])
+
+    closing_auction_score = bounded_score(
+        (25 if closing_position >= 80 else 15 if closing_position >= 65 else 5)
+        + (25 if volume_ratio >= 1.5 else 15 if volume_ratio >= 1.0 else 5)
+        + (20 if current_price > vwap_proxy else 0)
+        + (15 if turnover_cr >= 50 else 8 if turnover_cr >= 20 else 0)
+        + (15 if bullish_close and latest_volume > avg_volume_50 else 0),
+        100,
+    )
+
+    delivery_snapshot = fetch_nse_delivery_snapshot(symbol)
+    delivery_pct = delivery_snapshot.get("delivery_percentage")
+    delivery_qty = delivery_snapshot.get("delivery_quantity")
+    traded_qty = delivery_snapshot.get("traded_quantity")
+    if (delivery_pct is None or pd.isna(delivery_pct)) and delivery_qty and traded_qty:
+        delivery_pct = delivery_qty / traded_qty * 100
+    delivery_pct_float = coerce_float(delivery_pct, 0) or 0
+    delivery_score = 100 if delivery_pct_float >= 60 else 82 if delivery_pct_float >= 50 else 55 if delivery_pct_float >= 40 else 25 if delivery_pct_float else 35
+    delivery_classification = "Excellent" if delivery_pct_float >= 60 else "Strong" if delivery_pct_float >= 50 else "Neutral" if delivery_pct_float >= 40 else "Weak/Unavailable"
+
+    volume_profile_score = bounded_score(
+        (35 if volume_ratio >= 2 else 28 if volume_ratio >= 1.5 else 18 if volume_ratio >= 1 else 8)
+        + (20 if pocket_pivot else 0)
+        + (15 if volume_dryup and volume_ratio >= 1.1 else 0)
+        + (15 if turnover_cr >= 50 else 8 if turnover_cr >= 20 else 0)
+        + (15 if latest_volume > avg_volume_50 else 0),
+        100,
+    )
+
+    stock_return_5 = close.iloc[-1] / close.iloc[-6] - 1 if len(close) > 6 and close.iloc[-6] else 0
+    stock_return_20 = close.iloc[-1] / close.iloc[-21] - 1 if len(close) > 21 and close.iloc[-21] else 0
+    nifty = fetch_ohlcv_history("^NSEI")
+    rs_vs_nifty = None
+    if not nifty.empty and "close" in nifty.columns:
+        nifty_close = pd.to_numeric(nifty["close"], errors="coerce").dropna()
+        if len(nifty_close) > 21 and nifty_close.iloc[-21]:
+            nifty_return_20 = nifty_close.iloc[-1] / nifty_close.iloc[-21] - 1
+            rs_vs_nifty = (stock_return_20 - nifty_return_20) * 100
+    relative_strength_score = bounded_score(
+        (35 if rs_vs_nifty is not None and rs_vs_nifty > 5 else 25 if rs_vs_nifty is not None and rs_vs_nifty > 0 else 10)
+        + (25 if stock_return_5 > 0 else 0)
+        + (20 if stock_return_20 > 0 else 0)
+        + (20 if current_price >= close.tail(60).quantile(0.75) else 8),
+        100,
+    )
+
+    # Options OI data is not available from the current free data stack, so this is a neutral proxy.
+    options_score = bounded_score(
+        50
+        + (15 if volume_ratio >= 1.5 and bullish_close else 0)
+        + (10 if delivery_pct_float >= 50 else 0)
+        - (15 if not bullish_close else 0),
+        100,
+    )
+    options_status = "Proxy only - OI feed not connected"
+
+    sma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    bb_width = ((sma20 + 2 * std20) - (sma20 - 2 * std20)) / sma20
+    bb_squeeze = bool(bb_width.iloc[-1] <= bb_width.tail(120).quantile(0.20))
+    atr_contracting = bool(atr14.iloc[-1] < atr14.shift(5).iloc[-1]) if pd.notna(atr14.shift(5).iloc[-1]) else False
+    range_contracting = bool(((high - low) / close).tail(5).mean() < ((high - low) / close).shift(5).tail(5).mean())
+    breakout_level = float(high.tail(55).max())
+    darvas_box = bool(0 <= (breakout_level - current_price) / breakout_level * 100 <= 4) if breakout_level else False
+    flat_base = bool(close.tail(20).max() / max(close.tail(20).min(), 0.01) <= 1.08)
+    compression_score = bounded_score(
+        (25 if bb_squeeze else 0)
+        + (20 if atr_contracting else 0)
+        + (20 if range_contracting else 0)
+        + (15 if darvas_box else 0)
+        + (10 if flat_base else 0)
+        + (10 if nr7 or inside_day else 0),
+        100,
+    )
+
+    info = fetch_ticker_info(symbol)
+    earnings_growth = coerce_float(info.get("earningsGrowth"), None)
+    revenue_growth = coerce_float(info.get("revenueGrowth"), None)
+    ex_dividend_date = info.get("exDividendDate")
+    news_catalyst_score = bounded_score(
+        40
+        + (20 if earnings_growth is not None and earnings_growth > 0 else 0)
+        + (15 if revenue_growth is not None and revenue_growth > 0 else 0)
+        + (10 if ex_dividend_date else 0)
+        + (15 if stock_return_20 > 0 and volume_ratio >= 1.2 else 0),
+        100,
+    )
+
+    market_score = coerce_float(market_regime.get("market_regime_score"), 60) or 60
+    pattern_count = sum([pocket_pivot, darvas_box, bb_squeeze, atr_contracting, delivery_pct_float >= 50, closing_position >= 75])
+    historical_behaviour_score = bounded_score(
+        35
+        + pattern_count * 8
+        + (10 if market_score >= 70 else 0)
+        + (10 if rs_vs_nifty is not None and rs_vs_nifty > 0 else 0),
+        100,
+    )
+
+    liquidity_score = bounded_score(
+        (45 if turnover_cr >= 100 else 35 if turnover_cr >= 50 else 20 if turnover_cr >= 20 else 5)
+        + (25 if avg_volume_20 >= 1_000_000 else 18 if avg_volume_20 >= 300_000 else 8)
+        + (15 if current_price >= 100 else 5)
+        + (15 if daily_range_pct <= 8 else 5),
+        100,
+    )
+
+    weighted_probability = sum(
+        [
+            closing_strength_score / 100 * OVERNIGHT_SCORE_WEIGHTS["closing_strength_score"],
+            closing_auction_score / 100 * OVERNIGHT_SCORE_WEIGHTS["closing_auction_score"],
+            delivery_score / 100 * OVERNIGHT_SCORE_WEIGHTS["delivery_score"],
+            volume_profile_score / 100 * OVERNIGHT_SCORE_WEIGHTS["volume_profile_score"],
+            relative_strength_score / 100 * OVERNIGHT_SCORE_WEIGHTS["relative_strength_score"],
+            options_score / 100 * OVERNIGHT_SCORE_WEIGHTS["options_score"],
+            compression_score / 100 * OVERNIGHT_SCORE_WEIGHTS["compression_score"],
+            news_catalyst_score / 100 * OVERNIGHT_SCORE_WEIGHTS["news_catalyst_score"],
+            historical_behaviour_score / 100 * OVERNIGHT_SCORE_WEIGHTS["historical_behaviour_score"],
+            liquidity_score / 100 * OVERNIGHT_SCORE_WEIGHTS["liquidity_score"],
+        ]
+    )
+    tomorrow_probability = bounded_score(weighted_probability, 100)
+    if market_score < 60:
+        tomorrow_probability = bounded_score(tomorrow_probability - 8, 100)
+
+    gap_up_probability = bounded_score(
+        tomorrow_probability * 0.45
+        + closing_strength_score * 0.25
+        + volume_profile_score * 0.15
+        + max(stock_return_5 * 100, 0) * 2,
+        100,
+    )
+    gap_down_probability = bounded_score(100 - gap_up_probability + (12 if closing_position < 45 else 0), 100)
+    orb_probability = bounded_score(tomorrow_probability * 0.45 + volume_profile_score * 0.30 + liquidity_score * 0.25, 100)
+    vwap_hold_probability = bounded_score(tomorrow_probability * 0.40 + closing_strength_score * 0.35 + relative_strength_score * 0.25, 100)
+    intraday_trend_probability = bounded_score(tomorrow_probability * 0.45 + relative_strength_score * 0.25 + market_score * 0.15 + compression_score * 0.15, 100)
+    intraday_reversal_probability = bounded_score(100 - intraday_trend_probability + (10 if gap_up_probability > 80 and atr_pct > 4 else 0), 100)
+    expected_volume_expansion = round(max(volume_ratio, 0), 2)
+    expected_momentum_strength = bounded_score((closing_strength_score + relative_strength_score + volume_profile_score) / 3, 100)
+    best_window = overnight_best_entry_window(closing_strength_score, volume_profile_score, compression_score, gap_up_probability)
+    classification, classification_note = classify_overnight_watchlist(tomorrow_probability)
+
+    risk_to_reward = 3.2 if compression_score >= 70 and closing_strength_score >= 70 else 2.5 if liquidity_score >= 70 else 1.8
+    reason = []
+    if closing_position >= 75:
+        reason.append(f"closed in top zone of day range ({closing_position:.1f}%)")
+    if current_price > ema20.iloc[-1] and current_price > ema50.iloc[-1]:
+        reason.append("close above EMA20 and EMA50")
+    if delivery_pct_float:
+        reason.append(f"delivery {delivery_pct_float:.2f}% ({delivery_classification})")
+    if volume_ratio:
+        reason.append(f"relative volume {volume_ratio:.2f}x")
+    if pocket_pivot:
+        reason.append("pocket pivot volume proxy")
+    if compression_score >= 70:
+        reason.append("volatility compression active")
+    if rs_vs_nifty is not None:
+        reason.append(f"20D RS vs Nifty {rs_vs_nifty:.2f}%")
+
+    return {
+        "stock_name": row.get("name", symbol),
+        "nsecode": symbol,
+        "sector": row.get("sector", ""),
+        "current_price": round(current_price, 2),
+        "tomorrow_intraday_probability": tomorrow_probability,
+        "gap_up_probability": gap_up_probability,
+        "gap_down_probability": gap_down_probability,
+        "opening_range_breakout_probability": orb_probability,
+        "vwap_hold_probability": vwap_hold_probability,
+        "intraday_trend_probability": intraday_trend_probability,
+        "intraday_reversal_probability": intraday_reversal_probability,
+        "expected_intraday_volatility_pct": round(max(atr_pct, daily_range_pct), 2),
+        "expected_momentum_strength": expected_momentum_strength,
+        "expected_volume_expansion": expected_volume_expansion,
+        "best_entry_time_window": best_window,
+        "classification": classification,
+        "classification_note": classification_note,
+        "closing_strength_score": closing_strength_score,
+        "closing_auction_score": closing_auction_score,
+        "delivery_score": delivery_score,
+        "delivery_pct": round(delivery_pct_float, 2) if delivery_pct_float else None,
+        "delivery_classification": delivery_classification,
+        "volume_profile_score": volume_profile_score,
+        "relative_strength_score": relative_strength_score,
+        "options_score": options_score,
+        "options_status": options_status,
+        "compression_score": compression_score,
+        "news_catalyst_score": news_catalyst_score,
+        "historical_behaviour_score": historical_behaviour_score,
+        "liquidity_score": liquidity_score,
+        "risk_to_reward_estimate": round(risk_to_reward, 2),
+        "turnover_cr": round(turnover_cr, 2),
+        "closing_position_pct": round(closing_position, 2),
+        "volume_ratio": round(volume_ratio, 2),
+        "vcp_status": "Detected" if bb_squeeze and atr_contracting and range_contracting else "Partial" if compression_score >= 50 else "Not detected",
+        "darvas_box_status": "Detected" if darvas_box else "Not detected",
+        "pocket_pivot_status": "Detected" if pocket_pivot else "Not detected",
+        "market_regime": market_regime.get("market_regime"),
+        "market_regime_score": market_score,
+        "reason_for_selection": "; ".join(reason) if reason else "Overnight setup is not mature yet",
+    }
+
+
+def build_ai_overnight_model(df: pd.DataFrame, market_regime: dict[str, Any], history_limit: int = 100) -> pd.DataFrame:
+    if df.empty:
+        return df
+    rows: list[dict[str, Any]] = []
+    for _, row in df.head(history_limit).iterrows():
+        scored = score_ai_overnight_candidate(row, market_regime)
+        if scored.get("tomorrow_intraday_probability", 0) > 0:
+            rows.append(scored)
+    model = pd.DataFrame(rows)
+    if model.empty:
+        return model
+    return model.sort_values(
+        ["tomorrow_intraday_probability", "opening_range_breakout_probability", "liquidity_score"],
+        ascending=[False, False, False],
+        kind="mergesort",
+    )
+
+
+def apply_ai_overnight_filters(
+    model: pd.DataFrame,
+    min_probability: int,
+    min_delivery: int,
+    min_liquidity: int,
+    min_volume_score: int,
+    min_closing_strength: int,
+    min_rr: float,
+    min_turnover: int,
+) -> pd.DataFrame:
+    if model.empty:
+        return model
+    filtered = model[
+        (pd.to_numeric(model["tomorrow_intraday_probability"], errors="coerce") >= min_probability)
+        & (pd.to_numeric(model["delivery_pct"], errors="coerce").fillna(0) >= min_delivery)
+        & (pd.to_numeric(model["liquidity_score"], errors="coerce") >= min_liquidity)
+        & (pd.to_numeric(model["volume_profile_score"], errors="coerce") >= min_volume_score)
+        & (pd.to_numeric(model["closing_strength_score"], errors="coerce") >= min_closing_strength)
+        & (pd.to_numeric(model["risk_to_reward_estimate"], errors="coerce") >= min_rr)
+        & (pd.to_numeric(model["turnover_cr"], errors="coerce").fillna(0) >= min_turnover)
+    ].copy()
+    return filtered.sort_values(["tomorrow_intraday_probability", "gap_up_probability"], ascending=[False, False], kind="mergesort")
+
+
+def ai_overnight_display_columns(df: pd.DataFrame) -> list[str]:
+    columns = [
+        "stock_name",
+        "nsecode",
+        "sector",
+        "current_price",
+        "tomorrow_intraday_probability",
+        "classification",
+        "gap_up_probability",
+        "opening_range_breakout_probability",
+        "vwap_hold_probability",
+        "intraday_trend_probability",
+        "expected_intraday_volatility_pct",
+        "best_entry_time_window",
+        "closing_strength_score",
+        "delivery_score",
+        "delivery_pct",
+        "volume_profile_score",
+        "relative_strength_score",
+        "options_score",
+        "compression_score",
+        "news_catalyst_score",
+        "historical_behaviour_score",
+        "liquidity_score",
+        "risk_to_reward_estimate",
+        "turnover_cr",
+        "reason_for_selection",
+    ]
+    return [column for column in columns if column in df.columns]
+
+
+def render_ai_overnight_opportunity_page() -> None:
+    st.subheader("AI Overnight Opportunity")
+    st.caption("EOD watchlist engine for stocks most likely to become tomorrow's intraday leaders. Use it after market close, then confirm live with VWAP, ORB, RVOL, and market regime.")
+
+    with st.sidebar:
+        st.header("Overnight Controls")
+        rows_shown = st.slider("Rows shown", 5, 100, 25, 5, key="overnight_rows")
+        history_limit = st.slider("Candidates to score", 20, 200, 100, 20, key="overnight_history")
+        st.divider()
+        min_probability = st.slider("Minimum tomorrow probability", 0, 100, 80, 1, key="overnight_min_prob")
+        min_delivery = st.slider("Minimum delivery %", 0, 100, 40, 1, key="overnight_min_delivery")
+        min_liquidity = st.slider("Minimum liquidity score", 0, 100, 60, 1, key="overnight_min_liq")
+        min_volume_score = st.slider("Minimum volume profile score", 0, 100, 60, 1, key="overnight_min_volume")
+        min_closing_strength = st.slider("Minimum closing strength", 0, 100, 60, 1, key="overnight_min_close")
+        min_rr = st.slider("Minimum risk/reward estimate", 1.0, 5.0, 2.0, 0.25, key="overnight_min_rr")
+        min_turnover = st.slider("Minimum turnover crore", 0, 250, 20, 5, key="overnight_min_turnover")
+        if st.button("Refresh overnight opportunity", type="primary", width="stretch"):
+            run_scan.clear()
+            fetch_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            fetch_ticker_info.clear()
+            compute_iq5000_market_regime.clear()
+            st.rerun()
+
+    market_regime = compute_iq5000_market_regime()
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Market Regime", str(market_regime.get("market_regime")))
+    metric_b.metric("Regime Score", int(market_regime.get("market_regime_score", 0)))
+    metric_c.metric("Engine", "Tomorrow EOD")
+
+    with st.expander("Confirmation rule before next-day entry"):
+        st.markdown(
+            """
+            - Price above VWAP
+            - Opening Range Breakout confirmed
+            - Relative Volume above 2
+            - No major selling pressure
+            - AI Intraday Score above 90
+            - Market regime remains supportive
+            - Smart money score remains above threshold
+            """
+        )
+
+    with st.spinner("Fetching and scoring AI overnight opportunities..."):
+        df, error = run_scan(AI_OVERNIGHT_OPPORTUNITY_CLAUSE)
+    if error:
+        st.error(error)
+        st.caption("If Chartink rejects the pre-filter, adjust AI_OVERNIGHT_OPPORTUNITY_CLAUSE.")
+        return
+
+    model = build_ai_overnight_model(df, market_regime=market_regime, history_limit=history_limit)
+    if model.empty:
+        st.info("No candidates returned by the overnight pre-filter or scoring engine.")
+        return
+
+    filtered = apply_ai_overnight_filters(
+        model,
+        min_probability=min_probability,
+        min_delivery=min_delivery,
+        min_liquidity=min_liquidity,
+        min_volume_score=min_volume_score,
+        min_closing_strength=min_closing_strength,
+        min_rr=min_rr,
+        min_turnover=min_turnover,
+    )
+
+    metric_d, metric_e, metric_f = st.columns(3)
+    metric_d.metric("Scored candidates", len(model))
+    metric_e.metric("Final watchlist", len(filtered))
+    metric_f.metric("Top probability", int((filtered if not filtered.empty else model).iloc[0]["tomorrow_intraday_probability"]))
+
+    if filtered.empty:
+        st.warning("No stocks pass the current overnight filter. Loosen the controls or review the full scored universe below.")
+    else:
+        st.subheader("Tomorrow Watchlist")
+        table = filtered[ai_overnight_display_columns(filtered)].head(rows_shown)
+        display_dataframe(table, height=620)
+        st.download_button(
+            "Download overnight opportunity CSV",
+            filtered.to_csv(index=False).encode("utf-8"),
+            file_name="ai_overnight_opportunity_watchlist.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    with st.expander("Scored universe before overnight filters", expanded=filtered.empty):
+        display_dataframe(model[ai_overnight_display_columns(model)].head(rows_shown), height=560)
+
+    with st.expander("Overnight scoring weights"):
+        weights_df = pd.DataFrame(
+            [{"Module": key.replace("_", " ").title(), "Weight": value} for key, value in OVERNIGHT_SCORE_WEIGHTS.items()]
+        )
+        display_dataframe(weights_df)
+
+
 def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("High Accuracy Candidates")
@@ -4203,6 +4683,9 @@ def main() -> None:
         return
     if selected_page == "IQ-5000 AI Trading Platform":
         render_iq5000_platform_page()
+        return
+    if selected_page == "AI Overnight Opportunity":
+        render_ai_overnight_opportunity_page()
         return
     if selected_page == "AI Early Breakout Score":
         render_ai_early_breakout_page()
