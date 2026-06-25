@@ -1386,6 +1386,66 @@ def safe_sort_dataframe(
         return df
 
 
+def ensure_ai_overnight_columns(model: pd.DataFrame) -> pd.DataFrame:
+    if model.empty:
+        return model
+
+    safe = model.copy()
+
+    def numeric_series(source: str, default: float = 0) -> pd.Series:
+        if source in safe.columns:
+            return pd.to_numeric(safe[source], errors="coerce").fillna(default)
+        return pd.Series(default, index=safe.index)
+
+    numeric_defaults: dict[str, pd.Series | float] = {
+        "tomorrow_intraday_probability": 0,
+        "similarity_based_probability": numeric_series("tomorrow_intraday_probability", 0),
+        "module16_consensus_score": numeric_series("tomorrow_intraday_probability", 0) * 0.80,
+        "delivery_pct": 0,
+        "liquidity_score": 0,
+        "volume_profile_score": 0,
+        "closing_strength_score": 0,
+        "risk_to_reward_estimate": 0,
+        "turnover_cr": 0,
+        "market_memory_score": numeric_series("historical_behaviour_score", 0),
+        "market_dna_score": numeric_series("similarity_based_probability", 0),
+        "historical_win_rate": numeric_series("similarity_based_probability", 0),
+        "number_of_similar_historical_setups": 0,
+        "gap_up_probability": 0,
+        "opening_range_breakout_probability": 0,
+        "vwap_hold_probability": 0,
+        "intraday_trend_probability": 0,
+        "expected_intraday_volatility_pct": 0,
+        "delivery_score": 0,
+        "relative_strength_score": 0,
+        "options_score": 0,
+        "compression_score": 0,
+        "news_catalyst_score": 0,
+        "historical_behaviour_score": 0,
+    }
+    text_defaults = {
+        "module16_votes": "Unavailable",
+        "module16_decision": "Consensus unavailable - use live confirmation",
+        "final_trade_gate": "Watchlist only until live checks pass",
+        "live_confirmation_checklist": "Confirm VWAP, ORB, RVOL, selling pressure, market regime, and smart-money score.",
+        "classification": "Watchlist",
+        "best_entry_time_window": "After opening range confirmation",
+        "reason_for_selection": "Overnight setup scored with partial data.",
+    }
+
+    for column, default in numeric_defaults.items():
+        if column not in safe.columns:
+            safe[column] = default
+        safe[column] = pd.to_numeric(safe[column], errors="coerce").fillna(0)
+
+    for column, default in text_defaults.items():
+        if column not in safe.columns:
+            safe[column] = default
+        safe[column] = safe[column].fillna(default)
+
+    return safe
+
+
 def normalize_ohlcv_columns(history: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
         return history
@@ -4778,6 +4838,7 @@ def build_ai_overnight_model(df: pd.DataFrame, market_regime: dict[str, Any], hi
     model = pd.DataFrame(rows)
     if model.empty:
         return model
+    model = ensure_ai_overnight_columns(model)
     return safe_sort_dataframe(
         model,
         ["similarity_based_probability", "module16_consensus_score", "tomorrow_intraday_probability"],
@@ -4799,6 +4860,7 @@ def apply_ai_overnight_filters(
 ) -> pd.DataFrame:
     if model.empty:
         return model
+    model = ensure_ai_overnight_columns(model)
     filtered = model[
         (pd.to_numeric(model["tomorrow_intraday_probability"], errors="coerce") >= min_probability)
         & (pd.to_numeric(model["delivery_pct"], errors="coerce").fillna(0) >= min_delivery)
@@ -4810,7 +4872,7 @@ def apply_ai_overnight_filters(
         & (pd.to_numeric(model["similarity_based_probability"], errors="coerce").fillna(0) >= min_memory_probability)
         & (pd.to_numeric(model["module16_consensus_score"], errors="coerce").fillna(0) >= min_consensus_score)
     ].copy()
-    return filtered.sort_values(["similarity_based_probability", "module16_consensus_score"], ascending=[False, False], kind="mergesort")
+    return safe_sort_dataframe(filtered, ["similarity_based_probability", "module16_consensus_score"], [False, False])
 
 
 def ai_overnight_display_columns(df: pd.DataFrame) -> list[str]:
