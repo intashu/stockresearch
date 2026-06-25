@@ -4088,6 +4088,240 @@ def iq5000_display_columns(df: pd.DataFrame) -> list[str]:
     return [column for column in columns if column in df.columns]
 
 
+def safe_max_value(df: pd.DataFrame, column: str) -> float | None:
+    if df.empty or column not in df.columns:
+        return None
+    values = pd.to_numeric(df[column], errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.max())
+
+
+def format_score_check(label: str, actual: float | None, required: float, suffix: str = "") -> dict[str, Any]:
+    if actual is None:
+        value = "Unavailable"
+        passed = False
+    else:
+        value = f"{actual:.2f}{suffix}"
+        passed = actual >= required
+    return {
+        "Condition": label,
+        "Best Available": value,
+        "Minimum Required": f"{required:.2f}{suffix}",
+        "Status": "Pass" if passed else "Fail",
+    }
+
+
+def market_status_label(market_score: float, filtered_count: int, near_count: int = 0) -> str:
+    if market_score >= 85 and filtered_count > 0:
+        return "GREEN - AGGRESSIVE BUYING ENVIRONMENT"
+    if market_score >= 70 and filtered_count > 0:
+        return "GREEN - SELECTIVE BUYING ENVIRONMENT"
+    if market_score >= 60 and near_count > 0:
+        return "YELLOW - WATCHLIST ONLY"
+    if market_score >= 50:
+        return "ORANGE - DEFENSIVE MODE"
+    return "RED - CAPITAL PRESERVATION MODE"
+
+
+def render_no_trade_decision_engine(
+    *,
+    model: pd.DataFrame,
+    market_regime: dict[str, Any],
+    failed_conditions: list[dict[str, Any]],
+    watchlist: pd.DataFrame,
+    watchlist_columns: list[str],
+    context: str,
+) -> None:
+    market_score = coerce_float(market_regime.get("market_regime_score"), 0) or 0
+    near_count = len(watchlist) if isinstance(watchlist, pd.DataFrame) else 0
+
+    st.error("STATUS: NO TRADE TODAY")
+    st.caption("Reason: Capital preservation has the highest expected value under current market conditions.")
+
+    st.subheader("Why No Trade?")
+    if failed_conditions:
+        display_dataframe(pd.DataFrame(failed_conditions), height=360)
+    else:
+        st.info("No complete qualifying setup is available from the current scored universe.")
+
+    status = market_status_label(market_score, filtered_count=0, near_count=near_count)
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Market Status", status)
+    metric_b.metric("Recommended Cash Allocation", "100%")
+    metric_c.metric("Maximum Risk", "0%")
+
+    st.subheader("Trading Decision")
+    st.markdown(
+        """
+        **Decision:** No Capital Deployment
+
+        **Recommended Cash Allocation:** 100%
+
+        **Maximum Risk:** 0%
+        """
+    )
+
+    st.subheader("What Would Change The Decision?")
+    waiting_for = []
+    for row in failed_conditions:
+        if row.get("Status") == "Fail":
+            waiting_for.append(f"{row.get('Condition')} to reach {row.get('Minimum Required')}")
+    if not waiting_for:
+        waiting_for = [
+            "Stronger market breadth",
+            "Better sector rotation",
+            "Higher intraday/early breakout score",
+            "Smart money score above threshold",
+            "Delivery percentage above threshold",
+            "Relative volume above 2",
+            "Better risk-to-reward",
+        ]
+    for item in waiting_for[:10]:
+        st.markdown(f"- {item}")
+
+    st.subheader("Watchlist For Tomorrow")
+    if isinstance(watchlist, pd.DataFrame) and not watchlist.empty:
+        display_dataframe(watchlist[watchlist_columns].head(10), height=420)
+        st.download_button(
+            f"Download {context} no-trade watchlist CSV",
+            watchlist.head(10).to_csv(index=False).encode("utf-8"),
+            file_name=f"{slugify(context)}_no_trade_watchlist.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    else:
+        st.info("No watchlist candidates are available from the current scan.")
+
+    st.subheader("Trader Psychology Message")
+    st.info(
+        "There is no obligation to trade every day. Professional traders are paid for making high-quality decisions, not for being constantly invested. "
+        "Protecting capital today increases your ability to exploit higher-probability opportunities tomorrow."
+    )
+    st.markdown(
+        """
+        **Final Message:** NO TRADE TODAY. Continue monitoring the watchlist. Wait for confirmation.
+        Capital preservation takes priority over activity. The next high-probability opportunity is more valuable than forcing a low-quality trade.
+        """
+    )
+
+
+def build_iq5000_failed_conditions(
+    model: pd.DataFrame,
+    market_regime: dict[str, Any],
+    *,
+    min_iq_score: int,
+    min_market_regime: int,
+    min_module_score: int,
+    min_institutional: int,
+    min_swot: int,
+    min_delivery: int,
+    min_smart_money: int,
+    min_trade_probability: int,
+    min_rr: float,
+    min_turnover: int,
+) -> list[dict[str, Any]]:
+    highest_module = max(
+        [
+            safe_max_value(model, "ai_intraday_score") or 0,
+            safe_max_value(model, "ai_swing_score") or 0,
+            safe_max_value(model, "ai_early_breakout_score") or 0,
+        ]
+    )
+    checks = [
+        format_score_check("Market Regime Score", coerce_float(market_regime.get("market_regime_score"), 0), min_market_regime, "/100"),
+        format_score_check("AI IQ Score", safe_max_value(model, "ai_iq_score"), min_iq_score, "/1000"),
+        format_score_check("AI Intraday/Swing/Early Score", highest_module, min_module_score, "/100"),
+        format_score_check("AI Institutional Score", safe_max_value(model, "ai_institutional_score"), min_institutional, "/100"),
+        format_score_check("SWOT Advantage", safe_max_value(model, "swot_advantage_score"), min_swot, "/100"),
+        format_score_check("Delivery Percentage", safe_max_value(model, "delivery_pct"), min_delivery, "%"),
+        format_score_check("Smart Money Score", safe_max_value(model, "smart_money_score"), min_smart_money, "/100"),
+        format_score_check("Trade Probability", safe_max_value(model, "trade_probability"), min_trade_probability, "%"),
+        format_score_check("Risk/Reward", safe_max_value(model, "risk_reward_ratio"), min_rr),
+        format_score_check("Turnover", safe_max_value(model, "turnover_cr"), min_turnover, " Cr"),
+    ]
+    return checks
+
+
+def build_iq5000_no_trade_watchlist(model: pd.DataFrame) -> pd.DataFrame:
+    if model.empty:
+        return model
+    watchlist = model.copy()
+    watchlist["reason_for_monitoring"] = watchlist.get("reason_for_selection", "Near setup but final filters not met.")
+    watchlist["required_trigger_for_entry"] = (
+        "Live confirmation: VWAP hold, ORB, RVOL > 2, smart money above threshold, and risk/reward >= 1:3."
+    )
+    return safe_sort_dataframe(watchlist, ["ai_iq_score", "trade_probability", "ai_early_breakout_score"], [False, False, False])
+
+
+def iq5000_no_trade_watchlist_columns(df: pd.DataFrame) -> list[str]:
+    columns = [
+        "stock_name",
+        "nsecode",
+        "ai_early_breakout_score",
+        "ai_intraday_score",
+        "ai_institutional_score",
+        "expected_holding_period",
+        "reason_for_monitoring",
+        "required_trigger_for_entry",
+    ]
+    return [column for column in columns if column in df.columns]
+
+
+def build_overnight_failed_conditions(
+    model: pd.DataFrame,
+    market_regime: dict[str, Any],
+    *,
+    min_probability: int,
+    min_delivery: int,
+    min_liquidity: int,
+    min_volume_score: int,
+    min_closing_strength: int,
+    min_rr: float,
+    min_turnover: int,
+    min_memory_probability: int,
+    min_consensus_score: int,
+) -> list[dict[str, Any]]:
+    model = ensure_ai_overnight_columns(model)
+    return [
+        format_score_check("Market Regime Score", coerce_float(market_regime.get("market_regime_score"), 0), 70, "/100"),
+        format_score_check("Tomorrow Intraday Probability", safe_max_value(model, "tomorrow_intraday_probability"), min_probability, "%"),
+        format_score_check("Memory Probability", safe_max_value(model, "similarity_based_probability"), min_memory_probability, "%"),
+        format_score_check("Consensus Agreement", safe_max_value(model, "module16_consensus_score"), min_consensus_score, "%"),
+        format_score_check("Risk/Reward", safe_max_value(model, "risk_to_reward_estimate"), min_rr),
+        format_score_check("Delivery Trend", safe_max_value(model, "delivery_pct"), min_delivery, "%"),
+        format_score_check("Volume Profile", safe_max_value(model, "volume_profile_score"), min_volume_score, "/100"),
+        format_score_check("Closing Strength", safe_max_value(model, "closing_strength_score"), min_closing_strength, "/100"),
+        format_score_check("Liquidity", safe_max_value(model, "liquidity_score"), min_liquidity, "/100"),
+        format_score_check("Turnover", safe_max_value(model, "turnover_cr"), min_turnover, " Cr"),
+    ]
+
+
+def build_overnight_no_trade_watchlist(model: pd.DataFrame) -> pd.DataFrame:
+    if model.empty:
+        return model
+    watchlist = ensure_ai_overnight_columns(model)
+    watchlist["reason_for_monitoring"] = watchlist.get("reason_for_selection", "Overnight setup requires live confirmation.")
+    watchlist["required_trigger_for_entry"] = (
+        "Next-day trigger: price above VWAP, opening range breakout, RVOL > 2, no selling pressure, and consensus improves."
+    )
+    return safe_sort_dataframe(watchlist, ["similarity_based_probability", "tomorrow_intraday_probability"], [False, False])
+
+
+def overnight_no_trade_watchlist_columns(df: pd.DataFrame) -> list[str]:
+    columns = [
+        "stock_name",
+        "nsecode",
+        "tomorrow_intraday_probability",
+        "similarity_based_probability",
+        "module16_consensus_score",
+        "best_entry_time_window",
+        "reason_for_monitoring",
+        "required_trigger_for_entry",
+    ]
+    return [column for column in columns if column in df.columns]
+
+
 def build_iq5000_performance_summary(trade_log: pd.DataFrame) -> pd.DataFrame:
     if trade_log.empty or "Actual Profit/Loss" not in trade_log.columns:
         return pd.DataFrame()
@@ -4273,8 +4507,29 @@ def render_iq5000_platform_page() -> None:
     metric_f.metric("Top AI IQ", int((filtered if not filtered.empty else model).iloc[0]["ai_iq_score"]))
 
     if filtered.empty:
-        st.error("NO TRADE TODAY - CAPITAL PRESERVATION HAS THE HIGHEST EXPECTED VALUE.")
-        st.caption("Loosen the sidebar controls to inspect near-miss setups, or review the full scored universe below.")
+        failed_conditions = build_iq5000_failed_conditions(
+            model,
+            market_regime,
+            min_iq_score=min_iq_score,
+            min_market_regime=min_market_regime,
+            min_module_score=min_module_score,
+            min_institutional=min_institutional,
+            min_swot=min_swot,
+            min_delivery=min_delivery,
+            min_smart_money=min_smart_money,
+            min_trade_probability=min_trade_probability,
+            min_rr=min_rr,
+            min_turnover=min_turnover,
+        )
+        watchlist = build_iq5000_no_trade_watchlist(model)
+        render_no_trade_decision_engine(
+            model=model,
+            market_regime=market_regime,
+            failed_conditions=failed_conditions,
+            watchlist=watchlist,
+            watchlist_columns=iq5000_no_trade_watchlist_columns(watchlist),
+            context="iq5000",
+        )
     else:
         st.subheader("Top 10 IQ-5000 Opportunities")
         top10 = filtered.head(10)
@@ -5001,7 +5256,28 @@ def render_ai_overnight_opportunity_page() -> None:
     metric_f.metric("Top memory probability", int((filtered if not filtered.empty else model).iloc[0]["similarity_based_probability"]))
 
     if filtered.empty:
-        st.warning("No stocks pass the current overnight filter. Loosen the controls or review the full scored universe below.")
+        failed_conditions = build_overnight_failed_conditions(
+            model,
+            market_regime,
+            min_probability=min_probability,
+            min_delivery=min_delivery,
+            min_liquidity=min_liquidity,
+            min_volume_score=min_volume_score,
+            min_closing_strength=min_closing_strength,
+            min_rr=min_rr,
+            min_turnover=min_turnover,
+            min_memory_probability=min_memory_probability,
+            min_consensus_score=min_consensus_score,
+        )
+        watchlist = build_overnight_no_trade_watchlist(model)
+        render_no_trade_decision_engine(
+            model=model,
+            market_regime=market_regime,
+            failed_conditions=failed_conditions,
+            watchlist=watchlist,
+            watchlist_columns=overnight_no_trade_watchlist_columns(watchlist),
+            context="overnight_opportunity",
+        )
     else:
         st.subheader("Tomorrow Watchlist")
         table = filtered[ai_overnight_display_columns(filtered)].head(rows_shown)
