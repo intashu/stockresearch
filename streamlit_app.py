@@ -974,7 +974,7 @@ def sidebar_page_choice() -> str:
                 "Institutional Breakout Setup",
                 "Breakout Probability Model",
                 "Hedge Fund Stock Picker",
-                "IQ-5000 AI Platform",
+                "IQ-5000 AI Trading Platform",
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
@@ -4201,7 +4201,7 @@ def main() -> None:
     if selected_page == "Hedge Fund Stock Picker":
         render_hedge_fund_model_page()
         return
-    if selected_page == "IQ-5000 AI Platform":
+    if selected_page == "IQ-5000 AI Trading Platform":
         render_iq5000_platform_page()
         return
     if selected_page == "AI Early Breakout Score":
