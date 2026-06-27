@@ -1016,6 +1016,7 @@ def sidebar_page_choice() -> str:
                 "AI Overnight Opportunity",
                 "AI Chart Reading Engine",
                 "AI Professional Chart Interpretation",
+                "AI Interactive Chart Teacher",
                 "AI Chart Reading & Replay",
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
@@ -6215,6 +6216,689 @@ def render_professional_chart_interpretation_page() -> None:
         display_dataframe(report["scores"], height=520)
 
 
+def escape_svg_text(value: Any) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def parse_price_zone(value: Any) -> tuple[float | None, float | None]:
+    if value is None:
+        return None, None
+    numbers = re.findall(r"-?\d+(?:\.\d+)?", str(value))
+    if not numbers:
+        return None, None
+    first = coerce_float(numbers[0], None)
+    second = coerce_float(numbers[1], first) if len(numbers) > 1 else first
+    if first is None or second is None:
+        return None, None
+    return min(first, second), max(first, second)
+
+
+def normalize_chart_history(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame()
+    working = history.copy()
+    if "date" not in working.columns:
+        working = working.reset_index()
+        first_column = working.columns[0]
+        working = working.rename(columns={first_column: "date"})
+    required = ["open", "high", "low", "close", "volume"]
+    if not set(required).issubset(working.columns):
+        return pd.DataFrame()
+    working["date"] = pd.to_datetime(working["date"].astype(str), errors="coerce")
+    for column in required:
+        working[column] = pd.to_numeric(working[column], errors="coerce")
+    working = working.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date")
+    if "volume" in working.columns:
+        working["volume"] = working["volume"].fillna(0)
+    return working.reset_index(drop=True)
+
+
+def fetch_chart_teacher_history(symbol: str, timeframe: str) -> pd.DataFrame:
+    timeframe = timeframe.strip()
+    if timeframe == "Monthly":
+        daily = fetch_ohlcv_history(symbol, lookback_days=2400)
+        return normalize_chart_history(resample_chart_timeframe(daily, "M"))
+    if timeframe == "Weekly":
+        daily = fetch_ohlcv_history(symbol, lookback_days=1800)
+        return normalize_chart_history(resample_chart_timeframe(daily, "W-FRI"))
+    if timeframe == "Daily":
+        return normalize_chart_history(fetch_ohlcv_history(symbol, lookback_days=1200))
+    if timeframe == "4 Hour":
+        hourly = fetch_interval_ohlcv_history(symbol, period="180d", interval="60m")
+        return normalize_chart_history(resample_chart_timeframe(hourly, "4h"))
+
+    interval_map = {
+        "1 Hour": ("730d", "60m"),
+        "30 Minute": ("60d", "30m"),
+        "15 Minute": ("30d", "15m"),
+        "5 Minute": ("5d", "5m"),
+        "1 Minute": ("5d", "1m"),
+    }
+    period, interval = interval_map.get(timeframe, ("60d", "60m"))
+    return normalize_chart_history(fetch_interval_ohlcv_history(symbol, period=period, interval=interval))
+
+
+def add_chart_teacher_indicators(history: pd.DataFrame) -> pd.DataFrame:
+    working = normalize_chart_history(history)
+    if working.empty:
+        return working
+    high = working["high"]
+    low = working["low"]
+    close = working["close"]
+    volume = working["volume"].fillna(0)
+    previous_close = close.shift(1)
+
+    working["ema20"] = close.ewm(span=20, adjust=False).mean()
+    working["ema50"] = close.ewm(span=50, adjust=False).mean()
+    working["ema100"] = close.ewm(span=100, adjust=False).mean()
+    working["ema190"] = close.ewm(span=190, adjust=False).mean()
+    working["ema200"] = close.ewm(span=200, adjust=False).mean()
+    working["sma200"] = close.rolling(200, min_periods=20).mean()
+    typical = (high + low + close) / 3
+    cumulative_volume = volume.cumsum().replace(0, pd.NA)
+    working["vwap"] = (typical * volume).cumsum() / cumulative_volume
+    true_range = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+    working["atr14"] = true_range.rolling(14, min_periods=3).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14, min_periods=3).mean()
+    loss = (-delta.clip(upper=0)).rolling(14, min_periods=3).mean()
+    working["rsi14"] = 100 - (100 / (1 + (gain / loss.replace(0, pd.NA))))
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    working["macd"] = ema12 - ema26
+    working["macd_signal"] = working["macd"].ewm(span=9, adjust=False).mean()
+    direction = close.diff().fillna(0).apply(lambda value: 1 if value > 0 else -1 if value < 0 else 0)
+    working["obv"] = (direction * volume).cumsum()
+    money_flow_multiplier = ((close - low) - (high - close)) / (high - low).replace(0, pd.NA)
+    working["ad_line"] = (money_flow_multiplier.fillna(0) * volume).cumsum()
+    positive_flow = (typical * volume).where(typical > typical.shift(1), 0).rolling(14, min_periods=3).sum()
+    negative_flow = (typical * volume).where(typical < typical.shift(1), 0).rolling(14, min_periods=3).sum()
+    working["mfi14"] = 100 - (100 / (1 + positive_flow / negative_flow.replace(0, pd.NA)))
+    sma20 = close.rolling(20, min_periods=5).mean()
+    std20 = close.rolling(20, min_periods=5).std()
+    working["bb_upper"] = sma20 + 2 * std20
+    working["bb_lower"] = sma20 - 2 * std20
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0)
+    atr = true_range.rolling(14, min_periods=3).mean().replace(0, pd.NA)
+    plus_di = 100 * plus_dm.rolling(14, min_periods=3).sum() / atr
+    minus_di = 100 * minus_dm.rolling(14, min_periods=3).sum() / atr
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
+    working["adx14"] = dx.rolling(14, min_periods=3).mean()
+    return working
+
+
+def build_chart_teacher_annotations(chart: dict[str, Any], visible_history: pd.DataFrame) -> list[dict[str, Any]]:
+    annotations: list[dict[str, Any]] = []
+    current = coerce_float(chart.get("current_price"), None)
+
+    demand_low, demand_high = parse_price_zone(chart.get("demand_zone"))
+    if demand_low is not None and demand_high is not None:
+        annotations.append(
+            {
+                "Type": "Demand Zone",
+                "Price": f"{demand_low:.2f} - {demand_high:.2f}",
+                "Color": "#10b981",
+                "Kind": "zone",
+                "Low": demand_low,
+                "High": demand_high,
+                "Explanation": "Buyers have repeatedly accepted price in this lower zone. A professional watches whether pullbacks dry up here instead of assuming every dip is safe.",
+            }
+        )
+
+    supply_low, supply_high = parse_price_zone(chart.get("supply_zone"))
+    if supply_low is not None and supply_high is not None:
+        annotations.append(
+            {
+                "Type": "Supply Zone",
+                "Price": f"{supply_low:.2f} - {supply_high:.2f}",
+                "Color": "#ef4444",
+                "Kind": "zone",
+                "Low": supply_low,
+                "High": supply_high,
+                "Explanation": "Sellers have defended this upper zone. A breakout needs acceptance above it, ideally with stronger volume.",
+            }
+        )
+
+    breakout = coerce_float(chart.get("breakout_level"), None)
+    if breakout is not None:
+        annotations.append(
+            {
+                "Type": "Breakout Level",
+                "Price": f"{breakout:.2f}",
+                "Color": "#2563eb",
+                "Kind": "line",
+                "Low": breakout,
+                "High": breakout,
+                "Explanation": "This is the resistance level the chart must absorb. Price near this line without volume can still fail.",
+            }
+        )
+
+    retest_low, retest_high = parse_price_zone(chart.get("retest_zone"))
+    if retest_low is not None and retest_high is not None:
+        annotations.append(
+            {
+                "Type": "Retest Zone",
+                "Price": f"{retest_low:.2f} - {retest_high:.2f}",
+                "Color": "#f59e0b",
+                "Kind": "zone",
+                "Low": retest_low,
+                "High": retest_high,
+                "Explanation": "If price breaks out, this zone is where professionals look for acceptance or rejection on the retest.",
+            }
+        )
+
+    stop_loss = coerce_float(chart.get("stop_loss"), None)
+    if stop_loss is not None:
+        annotations.append(
+            {
+                "Type": "Risk Line / Stop Loss",
+                "Price": f"{stop_loss:.2f}",
+                "Color": "#dc2626",
+                "Kind": "line",
+                "Low": stop_loss,
+                "High": stop_loss,
+                "Explanation": "The trade thesis weakens below this level. It defines risk before reward is considered.",
+            }
+        )
+
+    for target_name in ["target_1", "target_2"]:
+        target = coerce_float(chart.get(target_name), None)
+        if target is not None:
+            annotations.append(
+                {
+                    "Type": target_name.replace("_", " ").title(),
+                    "Price": f"{target:.2f}",
+                    "Color": "#16a34a",
+                    "Kind": "line",
+                    "Low": target,
+                    "High": target,
+                    "Explanation": "Reward reference derived from the current risk structure. Targets are planning levels, not guarantees.",
+                }
+            )
+
+    pattern = str(chart.get("pattern_detected", ""))
+    if pattern and pattern != "No major pattern confirmed":
+        annotations.append(
+            {
+                "Type": "Pattern Teacher",
+                "Price": chart.get("current_price", "Current"),
+                "Color": "#7c3aed",
+                "Kind": "label",
+                "Low": current,
+                "High": current,
+                "Explanation": f"{pattern} detected. The key evidence is structure near resistance, compression, higher lows, or volume behavior depending on the pattern.",
+            }
+        )
+
+    if str(chart.get("volume_confirmation", "")).lower() in {"confirmed", "partial"}:
+        annotations.append(
+            {
+                "Type": "Volume Evidence",
+                "Price": chart.get("current_price", "Current"),
+                "Color": "#0891b2",
+                "Kind": "label",
+                "Low": current,
+                "High": current,
+                "Explanation": f"Volume confirmation is {chart.get('volume_confirmation')}. Professionals want price progress to be supported by participation, not just thin moves.",
+            }
+        )
+
+    if visible_history.empty:
+        return annotations
+    last_close = float(pd.to_numeric(visible_history["close"], errors="coerce").dropna().iloc[-1])
+    if current is None:
+        current = last_close
+    return annotations
+
+
+def chart_teacher_indicator_snapshot(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame()
+    latest = history.iloc[-1]
+    previous = history.iloc[-2] if len(history) > 1 else latest
+    rows = [
+        {"Indicator": "OHLC", "Value": f"O {latest['open']:.2f} / H {latest['high']:.2f} / L {latest['low']:.2f} / C {latest['close']:.2f}", "Interpretation": "Latest visible candle context."},
+        {"Indicator": "EMA20", "Value": round(coerce_float(latest.get("ema20"), 0) or 0, 2), "Interpretation": "Short-term trend guide."},
+        {"Indicator": "EMA50", "Value": round(coerce_float(latest.get("ema50"), 0) or 0, 2), "Interpretation": "Intermediate trend guide."},
+        {"Indicator": "EMA200", "Value": round(coerce_float(latest.get("ema200"), 0) or 0, 2), "Interpretation": "Institutional long-term trend reference."},
+        {"Indicator": "SMA200", "Value": round(coerce_float(latest.get("sma200"), 0) or 0, 2), "Interpretation": "Widely watched long-term average."},
+        {"Indicator": "VWAP", "Value": round(coerce_float(latest.get("vwap"), 0) or 0, 2), "Interpretation": "Price acceptance benchmark for the visible chart."},
+        {"Indicator": "ATR14", "Value": round(coerce_float(latest.get("atr14"), 0) or 0, 2), "Interpretation": "Current volatility and stop-distance context."},
+        {"Indicator": "ADX14", "Value": round(coerce_float(latest.get("adx14"), 0) or 0, 2), "Interpretation": "Trend-strength proxy. Above 25 suggests stronger directional behavior."},
+        {"Indicator": "RSI14", "Value": round(coerce_float(latest.get("rsi14"), 0) or 0, 2), "Interpretation": "Momentum context; overbought alone is not a sell signal."},
+        {"Indicator": "MACD", "Value": round(coerce_float(latest.get("macd"), 0) or 0, 2), "Interpretation": "Momentum is improving" if coerce_float(latest.get("macd"), 0) >= coerce_float(previous.get("macd"), 0) else "Momentum is cooling."},
+        {"Indicator": "MFI14", "Value": round(coerce_float(latest.get("mfi14"), 0) or 0, 2), "Interpretation": "Money-flow context using price and volume."},
+        {"Indicator": "OBV", "Value": round(coerce_float(latest.get("obv"), 0) or 0, 0), "Interpretation": "On-balance volume accumulation/distribution proxy."},
+        {"Indicator": "A/D Line", "Value": round(coerce_float(latest.get("ad_line"), 0) or 0, 0), "Interpretation": "Accumulation/distribution pressure proxy."},
+    ]
+    return pd.DataFrame(rows)
+
+
+def render_tradingview_widget(symbol: str, timeframe: str, theme: str) -> None:
+    interval_map = {
+        "Monthly": "M",
+        "Weekly": "W",
+        "Daily": "D",
+        "4 Hour": "240",
+        "1 Hour": "60",
+        "30 Minute": "30",
+        "15 Minute": "15",
+        "5 Minute": "5",
+        "1 Minute": "1",
+    }
+    widget_id = f"tv_chart_{hashlib.md5((symbol + timeframe + theme).encode()).hexdigest()[:10]}"
+    tv_theme = "dark" if theme == "Dark" else "light"
+    interval = interval_map.get(timeframe, "D")
+    html = f"""
+    <div class="tradingview-widget-container" style="height:640px;width:100%;">
+      <div id="{widget_id}" style="height:640px;width:100%;"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+      new TradingView.widget({{
+        "autosize": true,
+        "symbol": "NSE:{escape_svg_text(symbol)}",
+        "interval": "{interval}",
+        "timezone": "Asia/Kolkata",
+        "theme": "{tv_theme}",
+        "style": "1",
+        "locale": "in",
+        "enable_publishing": false,
+        "allow_symbol_change": true,
+        "hide_side_toolbar": false,
+        "withdateranges": true,
+        "studies": ["Volume@tv-basicstudies", "RSI@tv-basicstudies", "MACD@tv-basicstudies"],
+        "container_id": "{widget_id}"
+      }});
+      </script>
+    </div>
+    """
+    components.html(html, height=660)
+
+
+def render_chart_teacher_svg(
+    history: pd.DataFrame,
+    chart: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    overlays: list[str],
+    theme: str,
+    symbol: str,
+    timeframe: str,
+) -> None:
+    if history.empty:
+        st.info("No chart candles available for visual rendering.")
+        return
+
+    visible = history.tail(180).copy().reset_index(drop=True)
+    width = 1180
+    height = 660
+    pad_left = 64
+    pad_right = 128
+    pad_top = 42
+    price_height = 430
+    volume_top = pad_top + price_height + 42
+    volume_height = 110
+    chart_width = width - pad_left - pad_right
+    candle_gap = chart_width / max(len(visible), 1)
+    candle_width = max(3, min(12, candle_gap * 0.58))
+
+    price_columns = ["high", "low"]
+    for column in ["ema20", "ema50", "ema100", "ema190", "ema200", "sma200", "vwap", "bb_upper", "bb_lower"]:
+        if column in visible.columns:
+            price_columns.append(column)
+    extra_prices: list[float] = []
+    for annotation in annotations:
+        for key in ["Low", "High"]:
+            value = coerce_float(annotation.get(key), None)
+            if value is not None:
+                extra_prices.append(value)
+    valid_price_lows: list[float] = []
+    valid_price_highs: list[float] = []
+    for column in price_columns:
+        if column not in visible.columns:
+            continue
+        series = pd.to_numeric(visible[column], errors="coerce").dropna()
+        if series.empty:
+            continue
+        valid_price_lows.append(float(series.min()))
+        valid_price_highs.append(float(series.max()))
+    if not valid_price_lows or not valid_price_highs:
+        st.info("No valid price values are available for chart rendering.")
+        return
+    price_min = min(valid_price_lows)
+    price_max = max(valid_price_highs)
+    if extra_prices:
+        price_min = min(price_min, min(extra_prices))
+        price_max = max(price_max, max(extra_prices))
+    price_span = max(price_max - price_min, 0.01)
+    price_min -= price_span * 0.06
+    price_max += price_span * 0.08
+    price_span = max(price_max - price_min, 0.01)
+    max_volume = max(float(visible["volume"].max()), 1)
+
+    def x_pos(index: int) -> float:
+        return pad_left + index * candle_gap + candle_gap / 2
+
+    def y_pos(price: float) -> float:
+        return pad_top + (price_max - price) / price_span * price_height
+
+    bg = "#0f172a" if theme == "Dark" else "#ffffff"
+    panel = "#111827" if theme == "Dark" else "#f8fafc"
+    grid = "#334155" if theme == "Dark" else "#e2e8f0"
+    text = "#e5e7eb" if theme == "Dark" else "#0f172a"
+    muted = "#94a3b8" if theme == "Dark" else "#64748b"
+    up_color = "#10b981"
+    down_color = "#f43f5e"
+
+    svg_parts: list[str] = [
+        f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg" role="img">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" rx="16" fill="{bg}"/>',
+        f'<rect x="18" y="18" width="{width-36}" height="{height-36}" rx="14" fill="{panel}" stroke="{grid}"/>',
+        f'<text x="{pad_left}" y="32" fill="{text}" font-size="18" font-family="Arial" font-weight="700">{escape_svg_text(symbol)} - {escape_svg_text(timeframe)} AI Visual Chart Teacher</text>',
+    ]
+
+    for step in range(6):
+        price = price_min + (price_span / 5) * step
+        y = y_pos(price)
+        svg_parts.append(f'<line x1="{pad_left}" y1="{y:.2f}" x2="{width-pad_right}" y2="{y:.2f}" stroke="{grid}" stroke-width="1" opacity="0.55"/>')
+        svg_parts.append(f'<text x="{width-pad_right+10}" y="{y+4:.2f}" fill="{muted}" font-size="11" font-family="Arial">{price:.2f}</text>')
+
+    if "Supply/Demand" in overlays:
+        for annotation in annotations:
+            if annotation.get("Kind") != "zone":
+                continue
+            low = coerce_float(annotation.get("Low"), None)
+            high = coerce_float(annotation.get("High"), None)
+            if low is None or high is None:
+                continue
+            y_high = y_pos(high)
+            y_low = y_pos(low)
+            color = annotation.get("Color", "#64748b")
+            svg_parts.append(
+                f'<rect x="{pad_left}" y="{y_high:.2f}" width="{chart_width}" height="{max(y_low-y_high, 2):.2f}" fill="{color}" opacity="0.12" stroke="{color}" stroke-width="1" stroke-dasharray="6 5"/>'
+            )
+            svg_parts.append(f'<text x="{pad_left+8}" y="{y_high-5:.2f}" fill="{color}" font-size="11" font-family="Arial" font-weight="700">{escape_svg_text(annotation.get("Type"))}</text>')
+
+    for index, candle in visible.iterrows():
+        open_price = float(candle["open"])
+        high_price = float(candle["high"])
+        low_price = float(candle["low"])
+        close_price = float(candle["close"])
+        x = x_pos(index)
+        color = up_color if close_price >= open_price else down_color
+        y_open = y_pos(open_price)
+        y_close = y_pos(close_price)
+        y_high = y_pos(high_price)
+        y_low = y_pos(low_price)
+        body_y = min(y_open, y_close)
+        body_height = max(abs(y_close - y_open), 2)
+        volume_height_px = (float(candle.get("volume", 0)) / max_volume) * volume_height
+        date_label = pd.to_datetime(candle["date"]).strftime("%Y-%m-%d %H:%M")
+        svg_parts.append(f'<line x1="{x:.2f}" y1="{y_high:.2f}" x2="{x:.2f}" y2="{y_low:.2f}" stroke="{color}" stroke-width="1.2"><title>{date_label} H {high_price:.2f} L {low_price:.2f}</title></line>')
+        svg_parts.append(f'<rect x="{x-candle_width/2:.2f}" y="{body_y:.2f}" width="{candle_width:.2f}" height="{body_height:.2f}" rx="1.2" fill="{color}"><title>{date_label} O {open_price:.2f} C {close_price:.2f}</title></rect>')
+        svg_parts.append(f'<rect x="{x-candle_width/2:.2f}" y="{volume_top + volume_height - volume_height_px:.2f}" width="{candle_width:.2f}" height="{volume_height_px:.2f}" fill="{color}" opacity="0.45"/>')
+
+    def draw_line(column: str, color: str, label: str, dashed: bool = False) -> None:
+        if column not in visible.columns:
+            return
+        points = []
+        for index, value in enumerate(pd.to_numeric(visible[column], errors="coerce")):
+            if pd.isna(value):
+                continue
+            points.append(f"{x_pos(index):.2f},{y_pos(float(value)):.2f}")
+        if len(points) < 2:
+            return
+        dash = ' stroke-dasharray="6 5"' if dashed else ""
+        svg_parts.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="1.8"{dash}/>')
+        last_value = coerce_float(visible[column].dropna().iloc[-1] if not visible[column].dropna().empty else None, None)
+        if last_value is not None:
+            svg_parts.append(f'<text x="{width-pad_right+10}" y="{y_pos(last_value)+4:.2f}" fill="{color}" font-size="11" font-family="Arial">{escape_svg_text(label)}</text>')
+
+    overlay_lines = {
+        "VWAP": ("vwap", "#0ea5e9", "VWAP", False),
+        "EMA20": ("ema20", "#22c55e", "EMA20", False),
+        "EMA50": ("ema50", "#f59e0b", "EMA50", False),
+        "EMA100": ("ema100", "#a855f7", "EMA100", False),
+        "EMA190": ("ema190", "#14b8a6", "EMA190", True),
+        "EMA200": ("ema200", "#ef4444", "EMA200", False),
+        "SMA200": ("sma200", "#64748b", "SMA200", True),
+    }
+    for overlay, args in overlay_lines.items():
+        if overlay in overlays:
+            draw_line(*args)
+    if "Bollinger Bands" in overlays:
+        draw_line("bb_upper", "#60a5fa", "BB+", True)
+        draw_line("bb_lower", "#60a5fa", "BB-", True)
+
+    if "Support/Resistance" in overlays or "Trading Plan" in overlays:
+        for annotation in annotations:
+            if annotation.get("Kind") == "zone":
+                continue
+            low = coerce_float(annotation.get("Low"), None)
+            if low is None:
+                continue
+            color = annotation.get("Color", "#64748b")
+            y = y_pos(low)
+            svg_parts.append(f'<line x1="{pad_left}" y1="{y:.2f}" x2="{width-pad_right}" y2="{y:.2f}" stroke="{color}" stroke-width="1.5" stroke-dasharray="8 5"/>')
+            svg_parts.append(f'<text x="{pad_left+8}" y="{y-6:.2f}" fill="{color}" font-size="11" font-family="Arial" font-weight="700">{escape_svg_text(annotation.get("Type"))}</text>')
+
+    if "Annotations" in overlays:
+        label_y = 72
+        for number, annotation in enumerate(annotations[:7], start=1):
+            color = annotation.get("Color", "#64748b")
+            price = coerce_float(annotation.get("High"), coerce_float(annotation.get("Low"), None))
+            y = y_pos(price) if price is not None else label_y
+            x = width - pad_right + 18
+            svg_parts.append(f'<circle cx="{x}" cy="{y:.2f}" r="10" fill="{color}"/>')
+            svg_parts.append(f'<text x="{x-3}" y="{y+4:.2f}" fill="#ffffff" font-size="10" font-family="Arial" font-weight="700">{number}</text>')
+
+    svg_parts.append(f'<text x="{pad_left}" y="{volume_top-12}" fill="{muted}" font-size="12" font-family="Arial">Volume</text>')
+    svg_parts.append("</svg>")
+
+    legend_items = []
+    for number, annotation in enumerate(annotations[:7], start=1):
+        legend_items.append(
+            f'<div class="legend-row"><span style="background:{annotation.get("Color", "#64748b")}">{number}</span><b>{escape_svg_text(annotation.get("Type"))}</b><small>{escape_svg_text(annotation.get("Explanation"))}</small></div>'
+        )
+
+    html = f"""
+    <div style="font-family:Arial, sans-serif;">
+      <div style="border-radius:16px; overflow:hidden; border:1px solid {grid}; background:{bg};">
+        {''.join(svg_parts)}
+      </div>
+      <style>
+        .legend-grid {{
+          display:grid;
+          grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+          gap:10px;
+          margin-top:12px;
+        }}
+        .legend-row {{
+          border:1px solid {grid};
+          border-radius:10px;
+          padding:10px;
+          background:{panel};
+          color:{text};
+        }}
+        .legend-row span {{
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          width:22px;
+          height:22px;
+          border-radius:999px;
+          color:white;
+          font-size:12px;
+          font-weight:700;
+          margin-right:8px;
+        }}
+        .legend-row small {{
+          display:block;
+          color:{muted};
+          line-height:1.4;
+          margin-top:5px;
+        }}
+      </style>
+      <div class="legend-grid">{''.join(legend_items)}</div>
+    </div>
+    """
+    components.html(html, height=880)
+
+
+def chart_teacher_live_panel(report: dict[str, Any], visible_history: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    chart = report.get("chart", {})
+    visible = visible_history.copy()
+    latest = visible.iloc[-1] if not visible.empty else pd.Series(dtype=object)
+    latest_close = coerce_float(latest.get("close"), coerce_float(chart.get("current_price"), 0)) or 0
+    ema20 = coerce_float(latest.get("ema20"), 0) or 0
+    ema50 = coerce_float(latest.get("ema50"), 0) or 0
+    rsi = coerce_float(latest.get("rsi14"), chart.get("rsi")) or 0
+    adx = coerce_float(latest.get("adx14"), 0) or 0
+    trend = "Bullish" if latest_close > ema20 > ema50 else "Neutral" if latest_close >= ema50 else "Bearish"
+    control = "Buyers" if latest_close >= ema20 and rsi >= 50 else "Sellers" if latest_close < ema50 else "Balanced"
+    risk = "Elevated" if (coerce_float(chart.get("false_breakout_risk"), 100) or 100) >= 60 else "Controlled"
+    action = (
+        "Wait for breakout plus volume and VWAP confirmation"
+        if report.get("verdict", "").lower().find("watch") >= 0 or (coerce_float(chart.get("chart_quality_score"), 0) or 0) < 85
+        else "Eligible for active watchlist; execute only after live confirmation"
+    )
+    rows = [
+        {"Panel": "Visible Timeframe", "Reading": timeframe, "Professional Interpretation": "The analysis is regenerated whenever this timeframe or symbol changes."},
+        {"Panel": "Current Trend", "Reading": trend, "Professional Interpretation": f"Close is {latest_close:.2f}; EMA20 is {ema20:.2f}; EMA50 is {ema50:.2f}."},
+        {"Panel": "Buyer vs Seller Control", "Reading": control, "Professional Interpretation": "Control is inferred from price acceptance around moving averages, RSI, candle position, and volume context."},
+        {"Panel": "Market Structure", "Reading": chart.get("chart_stage", "Unavailable"), "Professional Interpretation": chart.get("reason", "Structure evidence is still developing.")},
+        {"Panel": "Pattern Quality", "Reading": chart.get("pattern_detected", "Unavailable"), "Professional Interpretation": "A pattern matters only when price, volume, and risk location agree."},
+        {"Panel": "Institutional Activity", "Reading": chart.get("institutional_footprints", "Unavailable"), "Professional Interpretation": "Institutional footprints are inferred from higher lows, OBV/A-D behavior, repeated tests, and volume expansion."},
+        {"Panel": "Volume Confirmation", "Reading": chart.get("volume_confirmation", "Unavailable"), "Professional Interpretation": f"ADX is {adx:.2f}; professionals prefer expansion on up moves and contraction on pullbacks."},
+        {"Panel": "Current Risk", "Reading": risk, "Professional Interpretation": f"False breakout risk is {chart.get('false_breakout_risk', 'Unavailable')}/100."},
+        {"Panel": "Recommended Action", "Reading": action, "Professional Interpretation": "This is a research workflow. Live execution still requires VWAP, ORB, liquidity, and market-regime confirmation."},
+        {"Panel": "Confidence Level", "Reading": report.get("summary", {}).get("Confidence Level", "Unavailable"), "Professional Interpretation": "Confidence is probabilistic, never guaranteed."},
+    ]
+    return pd.DataFrame(rows)
+
+
+def render_interactive_chart_teacher_page() -> None:
+    st.subheader("AI Interactive Chart Reading & Visual Chart Teacher")
+    st.caption("Module 20 workstation: interactive chart, visual annotations, institutional-style explanation, smart-money context, and a complete trading plan.")
+
+    with st.sidebar:
+        st.header("Visual Chart Teacher")
+        symbol = st.text_input("Stock symbol or company name", value="RELIANCE", key="interactive_teacher_symbol")
+        timeframe = st.selectbox(
+            "Chart timeframe",
+            ["Daily", "Weekly", "Monthly", "4 Hour", "1 Hour", "30 Minute", "15 Minute", "5 Minute", "1 Minute"],
+            index=0,
+            key="interactive_teacher_timeframe",
+        )
+        chart_mode = st.radio("Chart engine", ["AI Annotated Chart", "TradingView Widget", "Both"], index=0, key="interactive_teacher_mode")
+        theme = st.radio("Theme", ["Dark", "Light"], index=0, horizontal=True, key="interactive_teacher_theme")
+        lookback = st.slider("Visible candles", 60, 300, 160, 10, key="interactive_teacher_lookback")
+        overlays = st.multiselect(
+            "Overlay toggles",
+            ["VWAP", "EMA20", "EMA50", "EMA100", "EMA190", "EMA200", "SMA200", "Bollinger Bands", "Support/Resistance", "Supply/Demand", "Trading Plan", "Annotations"],
+            default=["VWAP", "EMA20", "EMA50", "EMA200", "Bollinger Bands", "Support/Resistance", "Supply/Demand", "Trading Plan", "Annotations"],
+            key="interactive_teacher_overlays",
+        )
+        capital = st.number_input("Trading capital", min_value=10_000.0, value=500_000.0, step=50_000.0, key="interactive_teacher_capital")
+        risk_pct = st.slider("Max risk per idea %", 0.25, 5.0, 1.0, 0.25, key="interactive_teacher_risk")
+        if st.button("Refresh interactive chart teacher", type="primary", width="stretch"):
+            fetch_ohlcv_history.clear()
+            fetch_interval_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            st.rerun()
+
+    cleaned_symbol = symbol.strip().upper().replace(".NS", "")
+    if not cleaned_symbol:
+        st.info("Enter an NSE symbol such as RELIANCE, SBIN, BEL, TRENT, or CDSL.")
+        return
+    if " " in cleaned_symbol:
+        st.warning("Use the NSE trading symbol for the most reliable chart data. Company-name lookup is limited by the current providers.")
+
+    with st.spinner(f"Building interactive chart workstation for {cleaned_symbol}..."):
+        visual_history = add_chart_teacher_indicators(fetch_chart_teacher_history(cleaned_symbol, timeframe))
+        daily_history = fetch_ohlcv_history(cleaned_symbol, lookback_days=1200)
+        report = build_professional_chart_report(cleaned_symbol, capital=capital, risk_pct=risk_pct, daily_history_override=daily_history)
+
+    if visual_history.empty:
+        st.info("No chart data is available for this timeframe. Try Daily or Weekly if intraday data is blocked by the provider.")
+        return
+    if not report:
+        st.info("No professional report could be generated for this symbol.")
+        return
+
+    visible_history = visual_history.tail(lookback)
+    chart = report.get("chart", {})
+    annotations = build_chart_teacher_annotations(chart, visible_history)
+
+    metric_a, metric_b, metric_c, metric_d, metric_e = st.columns(5)
+    metric_a.metric("Current Price", chart.get("current_price", "Unavailable"))
+    metric_b.metric("Final Rating", report.get("verdict", "Unavailable"))
+    metric_c.metric("Chart Quality", int(coerce_float(chart.get("chart_quality_score"), 0) or 0))
+    metric_d.metric("Trade Probability", report.get("summary", {}).get("Expected Probability", "Unavailable"))
+    metric_e.metric("False Breakout Risk", chart.get("false_breakout_risk", "Unavailable"))
+
+    chart_tab, panel_tab, report_tab, plan_tab, scores_tab = st.tabs(
+        ["Visual Chart Teacher", "Live Analysis Panel", "Professional Report", "Trading Plan", "Indicators & Scores"]
+    )
+
+    with chart_tab:
+        if chart_mode in {"AI Annotated Chart", "Both"}:
+            render_chart_teacher_svg(visible_history, chart, annotations, overlays, theme, cleaned_symbol, timeframe)
+        if chart_mode in {"TradingView Widget", "Both"}:
+            st.markdown("**TradingView Interactive Chart**")
+            st.caption("Use this for zoom, pan, crosshair, drawing tools, and native TradingView indicators. The AI explanation below remains based on the app's data and scoring engine.")
+            render_tradingview_widget(cleaned_symbol, timeframe, theme)
+        st.markdown("**Educational Annotation Evidence**")
+        display_dataframe(pd.DataFrame([{key: value for key, value in item.items() if key not in {"Low", "High", "Kind", "Color"}} for item in annotations]), height=300)
+
+    with panel_tab:
+        display_dataframe(chart_teacher_live_panel(report, visible_history, timeframe), height=430)
+        st.info(report.get("summary", {}).get("Legendary Analyst Explanation", "Professional chart reading requires price, volume, structure, and risk to agree."))
+
+    with report_tab:
+        render_professional_report_tabs(report, height=360)
+
+    with plan_tab:
+        display_dataframe(report.get("plan", pd.DataFrame()), height=430)
+        st.markdown("**Execution Confirmation Checklist**")
+        checklist = pd.DataFrame(
+            [
+                {"Check": "VWAP / price acceptance", "Required Evidence": "Price holds above VWAP or key retest zone after breakout."},
+                {"Check": "Opening range / intraday trigger", "Required Evidence": "Break above ORB or pullback holds with reduced selling pressure."},
+                {"Check": "Relative volume", "Required Evidence": "Volume expands on the move, preferably RVOL above 1.5 to 2."},
+                {"Check": "Risk control", "Required Evidence": "Entry, stop, and target produce acceptable reward-to-risk before trade."},
+                {"Check": "Invalidation", "Required Evidence": "Close below stop/retest zone invalidates the setup."},
+            ]
+        )
+        display_dataframe(checklist, height=260)
+
+    with scores_tab:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Indicator Snapshot**")
+            display_dataframe(chart_teacher_indicator_snapshot(visible_history), height=520)
+        with right:
+            st.markdown("**AI Scores**")
+            display_dataframe(report.get("scores", pd.DataFrame()), height=520)
+        st.download_button(
+            "Download visual chart teacher annotations CSV",
+            pd.DataFrame([{key: value for key, value in item.items() if key not in {"Low", "High", "Kind", "Color"}} for item in annotations]).to_csv(index=False).encode("utf-8"),
+            file_name=f"{cleaned_symbol}_visual_chart_teacher_annotations.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+
 def initialize_chart_replay_state() -> None:
     if "chart_replay_memory" not in st.session_state:
         st.session_state["chart_replay_memory"] = pd.DataFrame(
@@ -6558,6 +7242,9 @@ def main() -> None:
         return
     if selected_page == "AI Professional Chart Interpretation":
         render_professional_chart_interpretation_page()
+        return
+    if selected_page == "AI Interactive Chart Teacher":
+        render_interactive_chart_teacher_page()
         return
     if selected_page == "AI Chart Reading & Replay":
         render_chart_reading_replay_page()
