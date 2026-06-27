@@ -1,6 +1,6 @@
 # Chartink Multi-Screener Stock Dashboard
 
-Deploy-ready Streamlit package for NSE stock screening, breakout probability scoring, hedge-fund style SWOT analysis, IQ-5000 research workflows, professional chart interpretation, interactive visual chart teaching, chart replay validation, and stock technical/SWOT cards.
+Deploy-ready Streamlit package for NSE stock screening, breakout probability scoring, hedge-fund style SWOT analysis, IQ-5000 research workflows, IQ Modules 23-40, professional chart interpretation, interactive visual chart teaching, chart replay validation, and stock technical/SWOT cards.
 
 ## Files
 

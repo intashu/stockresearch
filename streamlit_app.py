@@ -1018,6 +1018,7 @@ def sidebar_page_choice() -> str:
                 "AI Professional Chart Interpretation",
                 "AI Interactive Chart Teacher",
                 "AI Chart Reading & Replay",
+                *list(ADVANCED_IQ_MODULES.values()),
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
@@ -6899,6 +6900,680 @@ def render_interactive_chart_teacher_page() -> None:
         )
 
 
+ADVANCED_IQ_MODULES: dict[int, str] = {
+    23: "M23 - AI Order Flow Engine",
+    24: "M24 - AI Institutional Portfolio Tracker",
+    25: "M25 - AI Global Correlation Engine",
+    26: "M26 - AI Sector Rotation Engine",
+    27: "M27 - AI Capital Rotation Detector",
+    28: "M28 - AI Relative Performance Matrix",
+    29: "M29 - AI Market DNA Engine",
+    30: "M30 - AI Trade Coach",
+    31: "M31 - AI Learning Academy",
+    32: "M32 - AI Portfolio Manager",
+    33: "M33 - AI Trade Journal",
+    34: "M34 - AI Psychology Engine",
+    35: "M35 - AI Scenario Simulator",
+    36: "M36 - AI Replay Simulator",
+    37: "M37 - AI Research Report Generator",
+    38: "M38 - AI Live Market Radar",
+    39: "M39 - AI Opportunity Ranking",
+    40: "M40 - AI Master Brain",
+}
+ADVANCED_IQ_MODULE_LOOKUP = {label: module for module, label in ADVANCED_IQ_MODULES.items()}
+ADVANCED_DEFAULT_WATCHLIST = "RELIANCE, SBIN, HDFCBANK, ICICIBANK, BEL, HAL, LT, TRENT, CDSL, TCS, INFY, WABAG"
+ADVANCED_SECTOR_BASKETS: dict[str, list[str]] = {
+    "Auto": ["M&M", "TATAMOTORS", "MARUTI"],
+    "Banks": ["HDFCBANK", "ICICIBANK", "SBIN"],
+    "IT": ["TCS", "INFY", "HCLTECH"],
+    "PSU": ["SBIN", "BHEL", "NTPC"],
+    "Capital Goods": ["LT", "ABB", "SIEMENS"],
+    "Power": ["NTPC", "POWERGRID", "TATAPOWER"],
+    "Pharma": ["SUNPHARMA", "CIPLA", "DIVISLAB"],
+    "Realty": ["DLF", "LODHA", "OBEROIRLTY"],
+    "Defence": ["HAL", "BEL", "BDL"],
+    "Railways": ["IRFC", "RVNL", "RAILTEL"],
+    "Chemicals": ["PIDILITIND", "SRF", "AARTIIND"],
+    "FMCG": ["HINDUNILVR", "ITC", "NESTLEIND"],
+    "Energy": ["RELIANCE", "ONGC", "COALINDIA"],
+}
+GLOBAL_CORRELATION_ASSETS: dict[str, str] = {
+    "NIFTY": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "Dow Jones": "^DJI",
+    "NASDAQ": "^IXIC",
+    "S&P 500": "^GSPC",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "Dollar Index": "DX-Y.NYB",
+    "USD/INR": "USDINR=X",
+    "Crude Oil": "CL=F",
+    "US 10Y Yield": "^TNX",
+    "India VIX": "^INDIAVIX",
+}
+
+
+def parse_advanced_symbols(raw_symbols: str, limit: int = 25) -> list[str]:
+    symbols: list[str] = []
+    for token in re.split(r"[\s,;]+", raw_symbols.upper()):
+        cleaned = token.strip().replace(".NS", "")
+        if cleaned and cleaned not in symbols:
+            symbols.append(cleaned)
+    return symbols[:limit]
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_raw_yfinance_history(ticker: str, lookback_days: int = 365) -> pd.DataFrame:
+    if yf is None or not ticker:
+        return pd.DataFrame()
+    start = date.today() - timedelta(days=lookback_days)
+    try:
+        history = yf.download(ticker, start=start.isoformat(), progress=False, auto_adjust=False, threads=False)
+    except Exception:
+        return pd.DataFrame()
+    if history.empty:
+        return pd.DataFrame()
+    return normalize_ohlcv_columns(history)
+
+
+def advanced_pct_return(close: pd.Series, days: int) -> float | None:
+    clean = pd.to_numeric(close, errors="coerce").dropna()
+    if len(clean) <= days or clean.iloc[-days - 1] == 0:
+        return None
+    return float((clean.iloc[-1] / clean.iloc[-days - 1] - 1) * 100)
+
+
+def advanced_stock_metrics(symbol: str, lookback_days: int = 500) -> dict[str, Any]:
+    history = add_chart_teacher_indicators(fetch_ohlcv_history(symbol, lookback_days=lookback_days))
+    if history.empty or len(history) < 40:
+        return {"symbol": symbol, "status": "Historical data unavailable", "history": pd.DataFrame()}
+
+    close = pd.to_numeric(history["close"], errors="coerce").dropna()
+    high = pd.to_numeric(history["high"], errors="coerce").dropna()
+    low = pd.to_numeric(history["low"], errors="coerce").dropna()
+    open_price = pd.to_numeric(history["open"], errors="coerce").dropna()
+    volume = pd.to_numeric(history["volume"], errors="coerce").dropna()
+    if min(len(close), len(high), len(low), len(open_price), len(volume)) < 40:
+        return {"symbol": symbol, "status": "Insufficient clean history", "history": history}
+
+    latest_close = float(close.iloc[-1])
+    latest_open = float(open_price.iloc[-1])
+    latest_high = float(high.iloc[-1])
+    latest_low = float(low.iloc[-1])
+    day_range = max(latest_high - latest_low, 0.01)
+    closing_position = (latest_close - latest_low) / day_range * 100
+    body_pct = abs(latest_close - latest_open) / day_range * 100
+    avg_volume_20 = float(volume.tail(20).mean()) if len(volume) >= 20 else float(volume.mean())
+    volume_ratio = float(volume.iloc[-1] / avg_volume_20) if avg_volume_20 else 0
+    turnover_cr = latest_close * float(volume.iloc[-1]) / 10_000_000 if latest_close else 0
+    ret_5 = advanced_pct_return(close, 5)
+    ret_20 = advanced_pct_return(close, 20)
+    ret_60 = advanced_pct_return(close, 60)
+    ret_120 = advanced_pct_return(close, 120)
+    high_52w = float(high.tail(252).max()) if len(high) >= 60 else float(high.max())
+    drawdown_from_high = (latest_close / high_52w - 1) * 100 if high_52w else None
+    latest = history.iloc[-1]
+    previous = history.iloc[-11] if len(history) > 11 else history.iloc[0]
+    obv_slope = coerce_float(latest.get("obv"), 0) - coerce_float(previous.get("obv"), 0)
+    ad_slope = coerce_float(latest.get("ad_line"), 0) - coerce_float(previous.get("ad_line"), 0)
+    ema20 = coerce_float(latest.get("ema20"), None)
+    ema50 = coerce_float(latest.get("ema50"), None)
+    ema200 = coerce_float(latest.get("ema200"), None)
+    trend_status = "Bullish" if ema20 and ema50 and ema200 and latest_close > ema20 > ema50 > ema200 else "Neutral" if ema50 and latest_close >= ema50 else "Weak"
+
+    return {
+        "symbol": symbol,
+        "status": "OK",
+        "history": history,
+        "current_price": round(latest_close, 2),
+        "closing_position_pct": round(closing_position, 2),
+        "body_pct": round(body_pct, 2),
+        "volume_ratio": round(volume_ratio, 2),
+        "turnover_cr": round(turnover_cr, 2),
+        "return_5d": round(ret_5, 2) if ret_5 is not None else None,
+        "return_20d": round(ret_20, 2) if ret_20 is not None else None,
+        "return_60d": round(ret_60, 2) if ret_60 is not None else None,
+        "return_120d": round(ret_120, 2) if ret_120 is not None else None,
+        "drawdown_from_52w_high_pct": round(drawdown_from_high, 2) if drawdown_from_high is not None else None,
+        "rsi": round(coerce_float(latest.get("rsi14"), 50) or 50, 2),
+        "adx": round(coerce_float(latest.get("adx14"), 0) or 0, 2),
+        "mfi": round(coerce_float(latest.get("mfi14"), 50) or 50, 2),
+        "atr_pct": round((coerce_float(latest.get("atr14"), 0) or 0) / latest_close * 100, 2) if latest_close else None,
+        "obv_rising": bool(obv_slope > 0),
+        "ad_rising": bool(ad_slope > 0),
+        "trend_status": trend_status,
+    }
+
+
+def advanced_stock_context(symbol: str, capital: float = 500_000.0, risk_pct: float = 1.0) -> dict[str, Any]:
+    cleaned = symbol.strip().upper().replace(".NS", "")
+    metrics = advanced_stock_metrics(cleaned)
+    history = metrics.get("history", pd.DataFrame())
+    row = pd.Series({"nsecode": cleaned, "name": cleaned, "sector": ""})
+    market = compute_iq5000_market_regime()
+
+    try:
+        chart = score_ai_chart_reading_candidate(row, history_override=history if isinstance(history, pd.DataFrame) else None)
+    except Exception as exc:
+        chart = {"chart_quality_score": 0, "reason": f"Chart score unavailable: {exc}"}
+    try:
+        early = score_ai_early_breakout_candidate(row)
+    except Exception as exc:
+        early = {"ai_early_breakout_score": 0, "reason_for_selection": f"Early breakout score unavailable: {exc}"}
+    try:
+        iq = score_iq5000_candidate(row, market_regime=market, capital=capital, max_risk_pct=risk_pct, max_capital_pct=25.0)
+    except Exception as exc:
+        iq = {"ai_iq_score": 0, "reason_for_selection": f"IQ score unavailable: {exc}"}
+    try:
+        overnight = score_ai_overnight_candidate(row, market_regime=market)
+    except Exception as exc:
+        overnight = {"tomorrow_intraday_probability": 0, "reason_for_selection": f"Overnight score unavailable: {exc}"}
+    delivery = fetch_nse_delivery_snapshot(cleaned)
+    info = fetch_ticker_info(cleaned)
+
+    return {
+        "symbol": cleaned,
+        "metrics": metrics,
+        "history": history if isinstance(history, pd.DataFrame) else pd.DataFrame(),
+        "chart": chart if isinstance(chart, dict) else {},
+        "early": early if isinstance(early, dict) else {},
+        "iq": iq if isinstance(iq, dict) else {},
+        "overnight": overnight if isinstance(overnight, dict) else {},
+        "market": market,
+        "delivery": delivery if isinstance(delivery, dict) else {},
+        "info": info if isinstance(info, dict) else {},
+    }
+
+
+def advanced_scorecard_rows(context: dict[str, Any]) -> pd.DataFrame:
+    metrics = context.get("metrics", {})
+    chart = context.get("chart", {})
+    iq = context.get("iq", {})
+    early = context.get("early", {})
+    overnight = context.get("overnight", {})
+    rows = [
+        {"Metric": "Current Price", "Value": metrics.get("current_price", chart.get("current_price"))},
+        {"Metric": "Trend Status", "Value": metrics.get("trend_status")},
+        {"Metric": "Chart Quality Score", "Value": chart.get("chart_quality_score")},
+        {"Metric": "AI Early Breakout Score", "Value": early.get("ai_early_breakout_score")},
+        {"Metric": "AI IQ Score", "Value": iq.get("ai_iq_score")},
+        {"Metric": "Tomorrow Intraday Probability", "Value": overnight.get("tomorrow_intraday_probability")},
+        {"Metric": "Smart Money Score", "Value": iq.get("smart_money_score", early.get("smart_money_score"))},
+        {"Metric": "Delivery %", "Value": context.get("delivery", {}).get("delivery_percentage", early.get("delivery_pct"))},
+        {"Metric": "Turnover Cr", "Value": metrics.get("turnover_cr", early.get("turnover_cr"))},
+        {"Metric": "False Breakout Risk", "Value": chart.get("false_breakout_risk")},
+    ]
+    return pd.DataFrame(rows)
+
+
+def advanced_order_flow_table(context: dict[str, Any]) -> pd.DataFrame:
+    metrics = context.get("metrics", {})
+    chart = context.get("chart", {})
+    closing = coerce_float(metrics.get("closing_position_pct"), 50) or 50
+    rvol = coerce_float(metrics.get("volume_ratio"), 0) or 0
+    body = coerce_float(metrics.get("body_pct"), 0) or 0
+    obv = bool(metrics.get("obv_rising"))
+    ad = bool(metrics.get("ad_rising"))
+    false_risk = coerce_float(chart.get("false_breakout_risk"), 50) or 50
+    buyer = bounded_score(closing * 0.45 + min(rvol * 20, 35) + (12 if obv else 0) + (8 if ad else 0), 100)
+    seller = bounded_score((100 - closing) * 0.45 + (18 if rvol >= 1.5 and closing < 45 else 0) + false_risk * 0.20, 100)
+    absorption = bounded_score((30 if rvol >= 1.5 and body <= 45 else 10) + (20 if obv and ad else 0) + (20 if closing >= 60 else 0), 100)
+    liquidity_grab = bounded_score(false_risk * 0.35 + (25 if rvol >= 1.8 else 0) + (20 if closing <= 25 or closing >= 80 else 0), 100)
+    smart_money = bounded_score((buyer + absorption + (coerce_float(context.get("iq", {}).get("smart_money_score"), 0) or 0)) / 3, 100)
+    rows = [
+        {"Output": "Buyer Dominance", "Score": buyer, "Reading": "Strong" if buyer >= 70 else "Moderate" if buyer >= 50 else "Weak", "Evidence": f"Close position {closing:.1f}%, RVOL {rvol:.2f}, OBV rising {obv}."},
+        {"Output": "Seller Dominance", "Score": seller, "Reading": "High" if seller >= 70 else "Moderate" if seller >= 50 else "Low", "Evidence": f"False-breakout risk {false_risk:.0f}/100 and close position {closing:.1f}%."},
+        {"Output": "Absorption", "Score": absorption, "Reading": "Visible proxy" if absorption >= 65 else "Not clear", "Evidence": "High-volume narrow-body or strong close behavior can imply absorption, but true tape data is unavailable."},
+        {"Output": "Liquidity Grab", "Score": liquidity_grab, "Reading": "Watch closely" if liquidity_grab >= 65 else "Normal", "Evidence": "Proxy uses wick/close location, RVOL, and failed-breakout risk."},
+        {"Output": "Smart Money Activity", "Score": smart_money, "Reading": "Active" if smart_money >= 70 else "Developing" if smart_money >= 50 else "Weak", "Evidence": "Proxy blends buyer dominance, absorption, OBV/A-D behavior, and IQ smart-money score."},
+    ]
+    return pd.DataFrame(rows)
+
+
+def advanced_institutional_tracker_table(context: dict[str, Any]) -> pd.DataFrame:
+    delivery = context.get("delivery", {})
+    early = context.get("early", {})
+    iq = context.get("iq", {})
+    info = context.get("info", {})
+    delivery_pct = coerce_float(delivery.get("delivery_percentage"), coerce_float(early.get("delivery_pct"), 0)) or 0
+    conviction = bounded_score(
+        (40 if delivery_pct >= 60 else 30 if delivery_pct >= 50 else 18 if delivery_pct >= 40 else 8)
+        + (coerce_float(iq.get("ai_institutional_score"), 0) or 0) * 0.35
+        + (coerce_float(iq.get("smart_money_score"), 0) or 0) * 0.25,
+        100,
+    )
+    rows = [
+        {"Institution Type": "FII", "Available Evidence": "Not connected in current free data stack", "Proxy Reading": "Use exchange filings / quarterly shareholding when integrated"},
+        {"Institution Type": "DII", "Available Evidence": "Not connected in current free data stack", "Proxy Reading": "Use exchange filings / quarterly shareholding when integrated"},
+        {"Institution Type": "Mutual Funds", "Available Evidence": "Not connected in current free data stack", "Proxy Reading": "Track MF holding change when feed is available"},
+        {"Institution Type": "Promoters", "Available Evidence": info.get("heldPercentInsiders", "Unavailable"), "Proxy Reading": "Promoter/insider proxy from yfinance if returned"},
+        {"Institution Type": "Foreign Institutions", "Available Evidence": info.get("heldPercentInstitutions", "Unavailable"), "Proxy Reading": "Institutional ownership proxy from yfinance if returned"},
+        {"Institution Type": "Delivery Trend", "Available Evidence": f"{delivery_pct:.2f}%" if delivery_pct else "Unavailable", "Proxy Reading": "High delivery supports accumulation only when price structure also confirms"},
+        {"Institution Type": "Institutional Conviction Score", "Available Evidence": conviction, "Proxy Reading": "Accumulation" if conviction >= 70 else "Neutral" if conviction >= 45 else "Weak"},
+    ]
+    return pd.DataFrame(rows)
+
+
+def global_correlation_table() -> pd.DataFrame:
+    nifty = fetch_raw_yfinance_history("^NSEI", lookback_days=420)
+    nifty_close = pd.to_numeric(nifty.get("close", pd.Series(dtype="float64")), errors="coerce").dropna()
+    rows: list[dict[str, Any]] = []
+    for name, ticker in GLOBAL_CORRELATION_ASSETS.items():
+        history = fetch_raw_yfinance_history(ticker, lookback_days=420)
+        close = pd.to_numeric(history.get("close", pd.Series(dtype="float64")), errors="coerce").dropna()
+        if len(close) < 80:
+            rows.append({"Asset": name, "Ticker": ticker, "20D Return %": "Unavailable", "Correlation vs NIFTY": "Unavailable", "Risk Read": "Data unavailable"})
+            continue
+        ret20 = advanced_pct_return(close, 20)
+        ret60 = advanced_pct_return(close, 60)
+        correlation = "Unavailable"
+        if len(nifty_close) >= 80:
+            joined = pd.concat([close.pct_change().tail(120).reset_index(drop=True), nifty_close.pct_change().tail(120).reset_index(drop=True)], axis=1).dropna()
+            if len(joined) > 30:
+                correlation = round(float(joined.iloc[:, 0].corr(joined.iloc[:, 1])), 2)
+        risk_read = "Risk-on" if name in {"NIFTY", "BANKNIFTY", "NASDAQ", "S&P 500"} and (ret20 or 0) > 0 else "Risk-off hedge rising" if name in {"Gold", "Dollar Index", "US 10Y Yield", "India VIX"} and (ret20 or 0) > 0 else "Neutral"
+        rows.append({"Asset": name, "Ticker": ticker, "20D Return %": round(ret20, 2) if ret20 is not None else None, "60D Return %": round(ret60, 2) if ret60 is not None else None, "Correlation vs NIFTY": correlation, "Risk Read": risk_read})
+    return pd.DataFrame(rows)
+
+
+def sector_rotation_table() -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for sector, basket in ADVANCED_SECTOR_BASKETS.items():
+        returns_5: list[float] = []
+        returns_20: list[float] = []
+        returns_60: list[float] = []
+        bullish_count = 0
+        available = 0
+        for symbol in basket:
+            metrics = advanced_stock_metrics(symbol, lookback_days=260)
+            if metrics.get("status") != "OK":
+                continue
+            available += 1
+            for source, target in [(metrics.get("return_5d"), returns_5), (metrics.get("return_20d"), returns_20), (metrics.get("return_60d"), returns_60)]:
+                value = coerce_float(source, None)
+                if value is not None:
+                    target.append(value)
+            if metrics.get("trend_status") == "Bullish":
+                bullish_count += 1
+        if available == 0:
+            rows.append({"Sector": sector, "Sector Strength": "Unavailable", "Sector Momentum": "Unavailable", "Capital Rotation": "Data unavailable", "Leading/Weak": "Unavailable", "Basket": ", ".join(basket)})
+            continue
+        avg20 = sum(returns_20) / len(returns_20) if returns_20 else 0
+        avg60 = sum(returns_60) / len(returns_60) if returns_60 else 0
+        breadth = bullish_count / available * 100
+        score = bounded_score(50 + avg20 * 2.5 + avg60 * 0.8 + (breadth - 50) * 0.4, 100)
+        rows.append(
+            {
+                "Sector": sector,
+                "Sector Strength": score,
+                "Sector Momentum": round(sum(returns_5) / len(returns_5), 2) if returns_5 else None,
+                "20D Return %": round(avg20, 2),
+                "60D Return %": round(avg60, 2),
+                "Bullish Breadth %": round(breadth, 2),
+                "Capital Rotation": "Inflows improving" if score >= 70 else "Neutral" if score >= 45 else "Outflow/lagging",
+                "Leading/Weak": "Leading Sector" if score >= 75 else "Weak Sector" if score < 40 else "Middle of pack",
+                "Basket": ", ".join(basket),
+            }
+        )
+    return safe_sort_dataframe(pd.DataFrame(rows), ["Sector Strength", "20D Return %"], [False, False])
+
+
+def relative_performance_matrix(symbols: list[str]) -> pd.DataFrame:
+    nifty = fetch_raw_yfinance_history("^NSEI", lookback_days=260)
+    nifty_close = pd.to_numeric(nifty.get("close", pd.Series(dtype="float64")), errors="coerce").dropna()
+    nifty_20 = advanced_pct_return(nifty_close, 20) or 0
+    rows: list[dict[str, Any]] = []
+    for symbol in symbols:
+        metrics = advanced_stock_metrics(symbol, lookback_days=260)
+        if metrics.get("status") != "OK":
+            rows.append({"Stock": symbol, "Status": metrics.get("status"), "RS Score": 0})
+            continue
+        ret20 = coerce_float(metrics.get("return_20d"), 0) or 0
+        ret60 = coerce_float(metrics.get("return_60d"), 0) or 0
+        rs_nifty = ret20 - nifty_20
+        score = bounded_score(50 + rs_nifty * 4 + ret60 * 0.8 + (10 if metrics.get("trend_status") == "Bullish" else -8), 100)
+        rows.append(
+            {
+                "Stock": symbol,
+                "Current Price": metrics.get("current_price"),
+                "20D Return %": ret20,
+                "60D Return %": ret60,
+                "RS vs NIFTY 20D": round(rs_nifty, 2),
+                "RS Score": score,
+                "Trend": metrics.get("trend_status"),
+                "Matrix Read": "Outperforming" if score >= 70 else "Neutral" if score >= 45 else "Underperforming",
+            }
+        )
+    return safe_sort_dataframe(pd.DataFrame(rows), ["RS Score", "20D Return %"], [False, False])
+
+
+def market_dna_table(context: dict[str, Any]) -> pd.DataFrame:
+    chart = context.get("chart", {})
+    early = context.get("early", {})
+    iq = context.get("iq", {})
+    pattern = iq.get("pattern_detected") or chart.get("pattern_detected") or iq5000_pattern_label(early)
+    memory = get_iq5000_memory_estimate(str(pattern), str(iq.get("sector", "")), str(context.get("market", {}).get("market_regime", "")), coerce_float(iq.get("similarity_score"), 60) or 60)
+    rows = [
+        {"DNA Field": "Detected Pattern", "Value": pattern, "Interpretation": "The pattern label becomes the historical analogy key."},
+        {"DNA Field": "Most Similar Historical Stock", "Value": memory.get("most_similar_historical_stock"), "Interpretation": "Based on saved IQ-5000 memory when available; otherwise estimated."},
+        {"DNA Field": "Most Similar Historical Date", "Value": memory.get("most_similar_historical_date"), "Interpretation": "Unavailable until the journal/memory has enough stored trades."},
+        {"DNA Field": "Similarity Score", "Value": iq.get("similarity_score", "Unavailable"), "Interpretation": "Higher means current setup resembles known high-quality patterns."},
+        {"DNA Field": "Historical Win Rate", "Value": memory.get("historical_win_rate"), "Interpretation": "Estimated from saved memory or fallback pattern similarity."},
+        {"DNA Field": "Historical Average Return", "Value": memory.get("historical_average_return"), "Interpretation": "Research estimate, not a promised outcome."},
+        {"DNA Field": "Average Breakout Time", "Value": memory.get("historical_average_holding_days"), "Interpretation": "Used for patience and holding-period planning."},
+    ]
+    return pd.DataFrame(rows)
+
+
+def opportunity_ranking_table(symbols: list[str], capital: float, risk_pct: float) -> pd.DataFrame:
+    market = compute_iq5000_market_regime()
+    rows: list[dict[str, Any]] = []
+    for symbol in symbols:
+        row = pd.Series({"nsecode": symbol, "name": symbol, "sector": ""})
+        try:
+            iq = score_iq5000_candidate(row, market_regime=market, capital=capital, max_risk_pct=risk_pct, max_capital_pct=25.0)
+        except Exception as exc:
+            iq = {"nsecode": symbol, "ai_iq_score": 0, "reason_for_selection": f"Skipped: {exc}"}
+        if isinstance(iq, dict):
+            rows.append(
+                {
+                    "Stock": symbol,
+                    "AI IQ Score": iq.get("ai_iq_score", 0),
+                    "Intraday": iq.get("ai_intraday_score", 0),
+                    "Swing": iq.get("ai_swing_score", 0),
+                    "Institutional": iq.get("ai_institutional_score", 0),
+                    "Early Breakout": iq.get("ai_early_breakout_score", 0),
+                    "Smart Money": iq.get("smart_money_score", 0),
+                    "Low Risk": iq.get("risk_management_score", 0),
+                    "High Conviction": iq.get("trade_probability", 0),
+                    "Classification": iq.get("confidence_rating", "Research only"),
+                    "Reason": iq.get("reason_for_selection", ""),
+                }
+            )
+    return safe_sort_dataframe(pd.DataFrame(rows), ["AI IQ Score", "High Conviction"], [False, False])
+
+
+def render_module_symbol_controls(default_symbol: str = "RELIANCE") -> tuple[str, float, float]:
+    with st.sidebar:
+        st.header("Module Controls")
+        symbol = st.text_input("NSE symbol", value=default_symbol, key=f"advanced_symbol_{st.session_state.get('_advanced_module_key', 'x')}")
+        capital = st.number_input("Trading capital", min_value=10_000.0, value=500_000.0, step=50_000.0, key=f"advanced_capital_{st.session_state.get('_advanced_module_key', 'x')}")
+        risk_pct = st.slider("Max risk per idea %", 0.25, 5.0, 1.0, 0.25, key=f"advanced_risk_{st.session_state.get('_advanced_module_key', 'x')}")
+        if st.button("Refresh module data", type="primary", width="stretch", key=f"advanced_refresh_{st.session_state.get('_advanced_module_key', 'x')}"):
+            fetch_ohlcv_history.clear()
+            fetch_interval_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            fetch_ticker_info.clear()
+            fetch_raw_yfinance_history.clear()
+            st.rerun()
+    return symbol.strip().upper().replace(".NS", ""), capital, risk_pct
+
+
+def render_watchlist_controls(module_key: int) -> tuple[list[str], float, float]:
+    with st.sidebar:
+        st.header("Module Controls")
+        raw_symbols = st.text_area("NSE symbols", value=ADVANCED_DEFAULT_WATCHLIST, height=110, key=f"advanced_watchlist_{module_key}")
+        capital = st.number_input("Trading capital", min_value=10_000.0, value=500_000.0, step=50_000.0, key=f"advanced_watch_capital_{module_key}")
+        risk_pct = st.slider("Max risk per idea %", 0.25, 5.0, 1.0, 0.25, key=f"advanced_watch_risk_{module_key}")
+        if st.button("Refresh module data", type="primary", width="stretch", key=f"advanced_watch_refresh_{module_key}"):
+            fetch_ohlcv_history.clear()
+            fetch_interval_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            fetch_raw_yfinance_history.clear()
+            st.rerun()
+    return parse_advanced_symbols(raw_symbols, limit=25), capital, risk_pct
+
+
+def render_advanced_module_summary(context: dict[str, Any]) -> None:
+    metric_a, metric_b, metric_c, metric_d = st.columns(4)
+    metric_a.metric("Symbol", context.get("symbol", "Unavailable"))
+    metric_b.metric("Price", context.get("metrics", {}).get("current_price", "Unavailable"))
+    metric_c.metric("AI IQ Score", context.get("iq", {}).get("ai_iq_score", "Unavailable"))
+    metric_d.metric("Market Regime", context.get("market", {}).get("market_regime", "Unavailable"))
+
+
+def render_advanced_iq_module_page(module_key: int) -> None:
+    st.session_state["_advanced_module_key"] = module_key
+    title = ADVANCED_IQ_MODULES.get(module_key, "Advanced IQ Module")
+    st.subheader(title)
+
+    if module_key in {25, 26, 27}:
+        st.caption("Macro/sector module. Uses available yfinance/price proxies and labels unavailable institutional feeds clearly.")
+        if module_key == 25:
+            table = global_correlation_table()
+            risk_score = bounded_score(
+                50
+                + sum(8 for value in table.get("Risk Read", pd.Series(dtype="object")).astype(str) if "Risk-on" in value)
+                - sum(6 for value in table.get("Risk Read", pd.Series(dtype="object")).astype(str) if "Risk-off" in value),
+                100,
+            )
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("Global Market Risk", "Low/Moderate" if risk_score >= 60 else "Elevated")
+            col_b.metric("Correlation Score", risk_score)
+            col_c.metric("Mode", "Risk-On" if risk_score >= 60 else "Risk-Off")
+            display_dataframe(table, height=560)
+            return
+        sector_table = sector_rotation_table()
+        if module_key == 26:
+            col_a, col_b, col_c = st.columns(3)
+            leader = sector_table.iloc[0]["Sector"] if not sector_table.empty else "Unavailable"
+            laggard = sector_table.iloc[-1]["Sector"] if not sector_table.empty else "Unavailable"
+            col_a.metric("Leading Sector", leader)
+            col_b.metric("Weak Sector", laggard)
+            col_c.metric("Sectors Scanned", len(sector_table))
+            display_dataframe(sector_table, height=620)
+            return
+        rotation_rows = []
+        if not sector_table.empty:
+            leaders = sector_table.head(3)["Sector"].tolist()
+            laggards = sector_table.tail(3)["Sector"].tolist()
+            rotation_rows = [
+                {"Rotation Pair": f"{laggard} -> {leader}", "Signal": "Potential capital rotation", "Evidence": "Leader strength outranks laggard strength in the current proxy table."}
+                for leader, laggard in zip(leaders, laggards)
+            ]
+        display_dataframe(pd.DataFrame(rotation_rows), height=260)
+        st.markdown("**Underlying Sector Evidence**")
+        display_dataframe(sector_table, height=560)
+        return
+
+    if module_key in {28, 38, 39}:
+        symbols, capital, risk_pct = render_watchlist_controls(module_key)
+        if not symbols:
+            st.info("Enter at least one NSE symbol.")
+            return
+        if module_key == 28:
+            table = relative_performance_matrix(symbols)
+            st.caption("Ranks each stock against NIFTY using 20D/60D relative performance and trend quality.")
+            display_dataframe(table, height=620)
+            return
+        table = opportunity_ranking_table(symbols, capital, risk_pct)
+        if module_key == 38:
+            radar = table.copy()
+            radar["Radar Signal"] = radar.apply(
+                lambda row: "Elite setup entering radar" if coerce_float(row.get("AI IQ Score"), 0) >= 850 else "Monitor" if coerce_float(row.get("High Conviction"), 0) >= 65 else "Research only",
+                axis=1,
+            )
+            display_dataframe(radar, height=640)
+            return
+        display_dataframe(table.head(25), height=640)
+        st.download_button(
+            "Download opportunity ranking CSV",
+            table.to_csv(index=False).encode("utf-8"),
+            file_name="ai_opportunity_ranking.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        return
+
+    if module_key == 32:
+        symbols, capital, risk_pct = render_watchlist_controls(module_key)
+        table = opportunity_ranking_table(symbols, capital, risk_pct)
+        total_risk_budget = capital * risk_pct / 100
+        active = table[pd.to_numeric(table.get("AI IQ Score", pd.Series(dtype="float64")), errors="coerce") >= 800] if not table.empty else pd.DataFrame()
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric("Portfolio Capital", f"{capital:,.0f}")
+        col_b.metric("Risk Budget", f"{total_risk_budget:,.0f}")
+        col_c.metric("Qualified Ideas", len(active))
+        col_d.metric("Cash Mode", "High" if active.empty else "Selective")
+        allocation_rows = []
+        per_idea = total_risk_budget / max(len(active), 1)
+        for _, row in active.head(8).iterrows():
+            allocation_rows.append({"Stock": row.get("Stock"), "AI IQ Score": row.get("AI IQ Score"), "Max Rupee Risk": round(per_idea, 2), "Allocation Note": "Risk sized equally across qualified ideas"})
+        display_dataframe(pd.DataFrame(allocation_rows), height=300)
+        st.markdown("**Portfolio Opportunity Table**")
+        display_dataframe(table, height=520)
+        return
+
+    if module_key == 33:
+        if "advanced_trade_journal" not in st.session_state:
+            st.session_state["advanced_trade_journal"] = pd.DataFrame(columns=["Date", "Stock", "Reason", "Emotion", "Mistake", "Lesson", "Result"])
+        with st.form("advanced_trade_journal_form"):
+            col_a, col_b, col_c = st.columns(3)
+            trade_date = col_a.date_input("Trade date", value=date.today())
+            stock = col_b.text_input("Stock", value="RELIANCE")
+            result = col_c.text_input("Result", value="Open / P&L")
+            reason = st.text_area("Chart reason")
+            emotion = st.text_area("Emotion / behavior")
+            mistake = st.text_area("Mistakes")
+            lesson = st.text_area("Lesson")
+            submitted = st.form_submit_button("Save journal entry")
+        if submitted:
+            row = pd.DataFrame([{"Date": trade_date.isoformat(), "Stock": stock.upper(), "Reason": reason, "Emotion": emotion, "Mistake": mistake, "Lesson": lesson, "Result": result}])
+            st.session_state["advanced_trade_journal"] = pd.concat([st.session_state["advanced_trade_journal"], row], ignore_index=True)
+            st.success("Trade journal entry saved in session memory.")
+        journal = st.session_state["advanced_trade_journal"]
+        display_dataframe(journal, height=420)
+        if not journal.empty:
+            st.download_button("Download trade journal CSV", journal.to_csv(index=False).encode("utf-8"), "ai_trade_journal.csv", "text/csv", width="stretch")
+        return
+
+    if module_key == 34:
+        with st.sidebar:
+            trades_today = st.number_input("Trades taken today", min_value=0, value=0, step=1, key="psych_trades_today")
+            loss_streak = st.number_input("Current loss streak", min_value=0, value=0, step=1, key="psych_loss_streak")
+            daily_risk_used = st.slider("Daily risk used %", 0.0, 10.0, 0.0, 0.25, key="psych_risk_used")
+            urge = st.slider("Urge to trade / FOMO", 0, 10, 3, 1, key="psych_urge")
+        risk = bounded_score(trades_today * 10 + loss_streak * 15 + daily_risk_used * 8 + urge * 5, 100)
+        status = "Take a break" if risk >= 75 else "Defensive mode" if risk >= 55 else "Stable"
+        rows = [
+            {"Psychology Check": "Revenge Trading", "Status": "High risk" if loss_streak >= 3 or urge >= 8 else "Controlled", "Coach Note": "Do not trade to recover losses. Trade only valid setups."},
+            {"Psychology Check": "Overtrading", "Status": "High risk" if trades_today >= 5 else "Controlled", "Coach Note": "Professionals are paid for quality decisions, not activity."},
+            {"Psychology Check": "Daily Risk", "Status": "Exceeded" if daily_risk_used >= 3 else "Within limit", "Coach Note": "Stop trading when daily risk is consumed."},
+            {"Psychology Check": "FOMO", "Status": "High" if urge >= 7 else "Normal", "Coach Note": "If the setup is missed, wait for the next clean structure."},
+            {"Psychology Check": "Final Psychology Status", "Status": status, "Coach Note": "Capital protection is part of edge."},
+        ]
+        st.metric("Psychology Risk Score", risk)
+        display_dataframe(pd.DataFrame(rows), height=360)
+        return
+
+    if module_key == 36:
+        scenario = st.selectbox("Historical scenario", ["2008 Global Crisis", "2020 COVID Crash", "2020-2021 Rally", "2022 Bear Market", "2024 Bull Run"], key="replay_scenario")
+        rows = [
+            {"Replay Scenario": scenario, "Training Focus": "Practice entries without hindsight", "Rule": "Hide future candles, write thesis first, reveal outcome after."},
+            {"Replay Step": "1", "Training Focus": "Identify market regime", "Rule": "Do not use future news or final chart outcome."},
+            {"Replay Step": "2", "Training Focus": "Mark support, resistance, trend, volume", "Rule": "Write invalidation before entry."},
+            {"Replay Step": "3", "Training Focus": "Reveal 5/10/20 sessions", "Rule": "Score whether your thesis, not only P&L, was correct."},
+        ]
+        display_dataframe(pd.DataFrame(rows), height=300)
+        st.info("For stock-specific no-lookahead replay, use the existing AI Chart Reading & Replay page.")
+        return
+
+    symbol, capital, risk_pct = render_module_symbol_controls()
+    if not symbol:
+        st.info("Enter an NSE symbol.")
+        return
+    context = advanced_stock_context(symbol, capital=capital, risk_pct=risk_pct)
+    render_advanced_module_summary(context)
+
+    if module_key == 23:
+        st.caption("Order book, hidden liquidity, iceberg, spoofing, and delta volume require live Level-2/order-flow feeds. This page gives an OHLCV proxy and flags uncertainty.")
+        display_dataframe(advanced_order_flow_table(context), height=360)
+        return
+
+    if module_key == 24:
+        st.caption("Quarterly institution holdings require a shareholding feed. Current page combines available ownership proxies, delivery, and smart-money scores.")
+        display_dataframe(advanced_institutional_tracker_table(context), height=420)
+        return
+
+    if module_key == 29:
+        display_dataframe(market_dna_table(context), height=420)
+        return
+
+    if module_key == 30:
+        chart = context.get("chart", {})
+        rows = [
+            {"Coach Question": "Why?", "Answer": chart.get("reason", "The setup needs more evidence before action.")},
+            {"Coach Question": "What is happening?", "Answer": f"Chart stage: {chart.get('chart_stage', 'Unavailable')}; pattern: {chart.get('pattern_detected', 'Unavailable')}."},
+            {"Coach Question": "What confirms?", "Answer": "Breakout/retest acceptance, VWAP hold, RVOL expansion, strong close, and market regime support."},
+            {"Coach Question": "What invalidates?", "Answer": f"Failure below stop/retest zone. Current stop: {chart.get('stop_loss', 'Unavailable')}."},
+            {"Coach Question": "How professionals think?", "Answer": "They define risk first, wait for confirmation, and avoid forcing trades when evidence is incomplete."},
+        ]
+        display_dataframe(pd.DataFrame(rows), height=420)
+        return
+
+    if module_key == 31:
+        rows = [
+            {"Lesson": "Pattern", "Current Example": context.get("chart", {}).get("pattern_detected", "Unavailable"), "Teaching Point": "A pattern is only useful when risk, volume, and trend confirm."},
+            {"Lesson": "Pocket Pivot", "Current Example": context.get("early", {}).get("pocket_pivot_status", "Unavailable"), "Teaching Point": "Volume must exceed prior down-volume near a constructive price location."},
+            {"Lesson": "Replay", "Current Example": "Use Chart Reading & Replay page", "Teaching Point": "Replay trains decision quality without hindsight."},
+            {"Lesson": "Quiz", "Current Example": "Before entry, name confirmation and invalidation", "Teaching Point": "If you cannot state invalidation, you do not have a complete plan."},
+        ]
+        display_dataframe(pd.DataFrame(rows), height=340)
+        return
+
+    if module_key == 35:
+        iq = context.get("iq", {})
+        base_prob = coerce_float(iq.get("trade_probability"), coerce_float(context.get("chart", {}).get("chart_quality_score"), 50)) or 50
+        bull = bounded_score(base_prob * 0.70 + 20, 100)
+        side = bounded_score(35 - abs(base_prob - 60) * 0.25, 100)
+        bear = max(0, 100 - bull - side)
+        rows = [
+            {"Scenario": "Bull Case", "Probability %": bull, "Expected Path": f"Breakout/retest works; target zone near {iq.get('target_1', context.get('chart', {}).get('target_1', 'Unavailable'))}", "Invalidation": "Fails to hold breakout/retest zone."},
+            {"Scenario": "Sideways Case", "Probability %": side, "Expected Path": "Price remains inside range while volatility compresses.", "Invalidation": "Large volume breakdown or breakout."},
+            {"Scenario": "Bear Case", "Probability %": bear, "Expected Path": f"False breakout or trend failure toward stop {iq.get('stop_loss', context.get('chart', {}).get('stop_loss', 'Unavailable'))}", "Invalidation": "Strong close above resistance with volume."},
+        ]
+        display_dataframe(pd.DataFrame(rows), height=300)
+        return
+
+    if module_key == 37:
+        report = build_professional_chart_report(symbol, capital=capital, risk_pct=risk_pct)
+        if not report:
+            st.info("Report could not be generated.")
+            return
+        summary = report.get("summary", {})
+        report_text = "\n\n".join([f"{title}\n{body}" for title, body in summary.items()])
+        st.text_area("Institutional Research Report Draft", report_text, height=520)
+        st.download_button("Download research report draft", report_text.encode("utf-8"), file_name=f"{symbol}_institutional_research_report.txt", mime="text/plain", width="stretch")
+        return
+
+    if module_key == 40:
+        st.markdown("**Master Brain Consensus**")
+        scorecard = advanced_scorecard_rows(context)
+        display_dataframe(scorecard, height=360)
+        order_flow = advanced_order_flow_table(context)
+        dna = market_dna_table(context)
+        st.markdown("**Order Flow + Market DNA Evidence**")
+        left, right = st.columns(2)
+        with left:
+            display_dataframe(order_flow, height=320)
+        with right:
+            display_dataframe(dna, height=320)
+        final_score = bounded_score(
+            (coerce_float(context.get("iq", {}).get("ai_iq_score"), 0) or 0) / 10 * 0.35
+            + (coerce_float(context.get("chart", {}).get("chart_quality_score"), 0) or 0) * 0.20
+            + (coerce_float(context.get("early", {}).get("ai_early_breakout_score"), 0) or 0) * 0.20
+            + (coerce_float(context.get("overnight", {}).get("tomorrow_intraday_probability"), 0) or 0) * 0.15
+            + (coerce_float(context.get("market", {}).get("market_regime_score"), 60) or 60) * 0.10,
+            100,
+        )
+        st.metric("Master Brain Consensus Score", final_score)
+        st.info("Final decision remains evidence-based: no trade is better than forcing a low-quality setup.")
+        return
+
+    st.markdown("**Base Advanced Scorecard**")
+    display_dataframe(advanced_scorecard_rows(context), height=360)
+
+
 def initialize_chart_replay_state() -> None:
     if "chart_replay_memory" not in st.session_state:
         st.session_state["chart_replay_memory"] = pd.DataFrame(
@@ -7248,6 +7923,9 @@ def main() -> None:
         return
     if selected_page == "AI Chart Reading & Replay":
         render_chart_reading_replay_page()
+        return
+    if selected_page in ADVANCED_IQ_MODULE_LOOKUP:
+        render_advanced_iq_module_page(ADVANCED_IQ_MODULE_LOOKUP[selected_page])
         return
     if selected_page == "AI Early Breakout Score":
         render_ai_early_breakout_page()
