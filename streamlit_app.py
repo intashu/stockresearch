@@ -18,6 +18,13 @@ import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except ImportError:  # Plotly is required for the custom chart engine page.
+    go = None
+    make_subplots = None
+
+try:
     import yfinance as yf
 except ImportError:  # Optional dependency for local OHLCV enrichment.
     yf = None
@@ -1015,6 +1022,7 @@ def sidebar_page_choice() -> str:
                 "IQ-5000 AI Trading Platform",
                 "AI Overnight Opportunity",
                 "AI Chart Reading Engine",
+                "AI Custom Chart Engine",
                 "AI Professional Chart Interpretation",
                 "AI Interactive Chart Teacher",
                 "AI Chart Reading & Replay",
@@ -6900,6 +6908,625 @@ def render_interactive_chart_teacher_page() -> None:
         )
 
 
+CUSTOM_CHART_TIMEFRAMES = ["Monthly", "Weekly", "Daily", "4 Hour", "1 Hour", "30 Minute", "15 Minute", "5 Minute", "1 Minute"]
+CUSTOM_CHART_PROVIDER_PRIORITY = [
+    ("Zerodha Kite Connect API", "Future connector - not configured in this package"),
+    ("NSE Bhavcopy", "Future EOD connector - not enabled after SQL rollback"),
+    ("Yahoo Finance", "Active fallback for OHLCV"),
+    ("Uploaded CSV", "Active manual fallback"),
+    ("Polygon API", "Future connector"),
+    ("Alpha Vantage", "Future connector"),
+]
+CUSTOM_CHART_SYMBOL_ALIASES = {
+    "NIFTY": "^NSEI",
+    "NIFTY50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+    "NIFTYBANK": "^NSEBANK",
+    "INDIAVIX": "^INDIAVIX",
+}
+
+
+def normalize_custom_chart_symbol(symbol: str) -> str:
+    cleaned = symbol.strip().upper().replace(".NS", "")
+    return CUSTOM_CHART_SYMBOL_ALIASES.get(cleaned, cleaned)
+
+
+def load_uploaded_ohlcv_csv(uploaded_file: Any) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame()
+    try:
+        raw = pd.read_csv(uploaded_file)
+    except Exception:
+        return pd.DataFrame()
+    raw.columns = [re.sub(r"[^a-z0-9]+", "_", str(column).lower()).strip("_") for column in raw.columns]
+    rename_map: dict[str, str] = {}
+    for target, candidates in {
+        "date": ["date", "datetime", "timestamp", "time"],
+        "open": ["open", "o"],
+        "high": ["high", "h"],
+        "low": ["low", "l"],
+        "close": ["close", "adj_close", "c"],
+        "volume": ["volume", "vol", "v"],
+    }.items():
+        for candidate in candidates:
+            if candidate in raw.columns:
+                rename_map[candidate] = target
+                break
+    return normalize_chart_history(raw.rename(columns=rename_map))
+
+
+def load_custom_chart_engine_history(symbol: str, timeframe: str, provider: str, uploaded_file: Any) -> tuple[pd.DataFrame, str]:
+    if provider == "Uploaded CSV":
+        uploaded = load_uploaded_ohlcv_csv(uploaded_file)
+        return uploaded, "Uploaded CSV" if not uploaded.empty else "Uploaded CSV unavailable or invalid"
+
+    if provider == "Auto Provider Fallback" and uploaded_file is not None:
+        uploaded = load_uploaded_ohlcv_csv(uploaded_file)
+        if not uploaded.empty:
+            return uploaded, "Uploaded CSV"
+
+    # Zerodha/NSE bhavcopy placeholders intentionally fall through to Yahoo until credentials/connectors exist.
+    history = fetch_chart_teacher_history(symbol, timeframe)
+    if not history.empty:
+        return history, "Yahoo Finance"
+    uploaded = load_uploaded_ohlcv_csv(uploaded_file)
+    if not uploaded.empty:
+        return uploaded, "Uploaded CSV fallback"
+    return pd.DataFrame(), "No provider returned usable OHLCV"
+
+
+def add_custom_chart_engine_indicators(history: pd.DataFrame) -> pd.DataFrame:
+    working = add_chart_teacher_indicators(history)
+    if working.empty:
+        return working
+
+    high = pd.to_numeric(working["high"], errors="coerce")
+    low = pd.to_numeric(working["low"], errors="coerce")
+    close = pd.to_numeric(working["close"], errors="coerce")
+    volume = pd.to_numeric(working["volume"], errors="coerce").fillna(0)
+    previous_close = close.shift(1)
+    typical = (high + low + close) / 3
+    true_range = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+    atr14 = true_range.rolling(14, min_periods=3).mean()
+
+    for period in [20, 50, 100, 190, 200]:
+        working[f"sma{period}"] = close.rolling(period, min_periods=min(20, period)).mean()
+        working[f"avg_volume_{period}"] = volume.rolling(period, min_periods=min(20, period)).mean()
+
+    working["rvol"] = volume / working["avg_volume_20"].replace(0, pd.NA)
+    working["macd_histogram"] = working["macd"] - working["macd_signal"]
+    working["keltner_mid"] = close.ewm(span=20, adjust=False).mean()
+    working["keltner_upper"] = working["keltner_mid"] + atr14 * 1.5
+    working["keltner_lower"] = working["keltner_mid"] - atr14 * 1.5
+    working["pivot_point"] = (high.shift(1) + low.shift(1) + close.shift(1)) / 3
+    working["pivot_r1"] = 2 * working["pivot_point"] - low.shift(1)
+    working["pivot_s1"] = 2 * working["pivot_point"] - high.shift(1)
+    working["pivot_r2"] = working["pivot_point"] + (high.shift(1) - low.shift(1))
+    working["pivot_s2"] = working["pivot_point"] - (high.shift(1) - low.shift(1))
+
+    multiplier = 3.0
+    hl2 = (high + low) / 2
+    upper_band = hl2 + multiplier * atr14
+    lower_band = hl2 - multiplier * atr14
+    direction = pd.Series(1, index=working.index, dtype="int64")
+    supertrend = pd.Series(index=working.index, dtype="float64")
+    for index in range(len(working)):
+        if index == 0 or pd.isna(upper_band.iloc[index - 1]) or pd.isna(lower_band.iloc[index - 1]):
+            direction.iloc[index] = 1
+        elif close.iloc[index] > upper_band.iloc[index - 1]:
+            direction.iloc[index] = 1
+        elif close.iloc[index] < lower_band.iloc[index - 1]:
+            direction.iloc[index] = -1
+        else:
+            direction.iloc[index] = direction.iloc[index - 1]
+        supertrend.iloc[index] = lower_band.iloc[index] if direction.iloc[index] == 1 else upper_band.iloc[index]
+    working["supertrend"] = supertrend
+    working["supertrend_direction"] = direction
+    return working
+
+
+def custom_volume_profile(history: pd.DataFrame, bins: int = 16) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame()
+    close = pd.to_numeric(history["close"], errors="coerce")
+    volume = pd.to_numeric(history["volume"], errors="coerce").fillna(0)
+    valid = pd.DataFrame({"close": close, "volume": volume}).dropna()
+    if valid.empty or valid["close"].nunique() < 2:
+        return pd.DataFrame()
+    try:
+        valid["price_bin"] = pd.cut(valid["close"], bins=bins)
+    except Exception:
+        return pd.DataFrame()
+    profile = valid.groupby("price_bin", observed=False)["volume"].sum().reset_index()
+    if profile.empty:
+        return pd.DataFrame()
+    total_volume = float(profile["volume"].sum()) or 1.0
+    profile["Low"] = profile["price_bin"].apply(lambda interval: round(float(interval.left), 2))
+    profile["High"] = profile["price_bin"].apply(lambda interval: round(float(interval.right), 2))
+    profile["Volume"] = profile["volume"].round(0)
+    profile["Volume Share %"] = (profile["volume"] / total_volume * 100).round(2)
+    return profile[["Low", "High", "Volume", "Volume Share %"]].sort_values("Volume", ascending=False)
+
+
+def custom_chart_feature_events(history: pd.DataFrame, chart: dict[str, Any]) -> pd.DataFrame:
+    if history.empty or len(history) < 12:
+        return pd.DataFrame()
+    working = history.copy()
+    latest = working.iloc[-1]
+    previous = working.iloc[-2]
+    close = pd.to_numeric(working["close"], errors="coerce")
+    high = pd.to_numeric(working["high"], errors="coerce")
+    low = pd.to_numeric(working["low"], errors="coerce")
+    open_price = pd.to_numeric(working["open"], errors="coerce")
+    volume = pd.to_numeric(working["volume"], errors="coerce").fillna(0)
+    down_volume = volume.where(close < close.shift(1), 0)
+    latest_volume = coerce_float(latest.get("volume"), 0) or 0
+    highest_down_volume = coerce_float(down_volume.shift(1).rolling(10).max().iloc[-1], 0) or 0
+    pocket_pivot = bool(latest_volume > highest_down_volume and close.iloc[-1] > close.shift(1).iloc[-1])
+    inside_day = bool(high.iloc[-1] <= high.iloc[-2] and low.iloc[-1] >= low.iloc[-2])
+    nr7 = bool((high.iloc[-1] - low.iloc[-1]) <= (high - low).tail(7).min())
+    gap_up = bool(open_price.iloc[-1] > high.iloc[-2])
+    gap_down = bool(open_price.iloc[-1] < low.iloc[-2])
+    high_volume = bool((coerce_float(latest.get("rvol"), 0) or 0) >= 1.8)
+    close_position = (close.iloc[-1] - low.iloc[-1]) / max(high.iloc[-1] - low.iloc[-1], 0.01) * 100
+    bullish_candle = bool(close.iloc[-1] > open_price.iloc[-1] and close_position >= 65)
+    distribution_candle = bool(close.iloc[-1] < open_price.iloc[-1] and high_volume and close_position <= 40)
+    false_breakout_zone = bool((coerce_float(chart.get("false_breakout_risk"), 0) or 0) >= 65)
+    event_date = latest.get("date")
+    price = coerce_float(latest.get("high"), coerce_float(chart.get("current_price"), None))
+    rows: list[dict[str, Any]] = []
+
+    def add_event(name: str, active: bool, color: str, confidence: int, interpretation: str, implication: str) -> None:
+        if not active:
+            return
+        rows.append(
+            {
+                "Event": name,
+                "Date": event_date,
+                "Price": price,
+                "Color": color,
+                "Evidence": chart.get("reason", "Visible price/volume structure"),
+                "Professional Interpretation": interpretation,
+                "Potential Implication": implication,
+                "Confidence Level": confidence,
+            }
+        )
+
+    add_event(
+        "Pocket Pivot Candle",
+        pocket_pivot,
+        "#10b981",
+        78,
+        "Volume exceeded the highest down-volume of the previous 10 sessions while price closed up.",
+        "Potential institutional accumulation near a constructive price location.",
+    )
+    add_event(
+        "High Volume Candle",
+        high_volume,
+        "#2563eb",
+        70,
+        "Relative volume expanded versus the 20-period average.",
+        "Participation is rising; confirm whether it supports breakout or distribution.",
+    )
+    add_event(
+        "Bullish Control Candle",
+        bullish_candle,
+        "#16a34a",
+        72,
+        "Price closed in the upper part of the candle body/range.",
+        "Buyers controlled the latest visible candle.",
+    )
+    add_event(
+        "Distribution Candle",
+        distribution_candle,
+        "#ef4444",
+        74,
+        "High volume with weak close suggests selling pressure.",
+        "Avoid aggressive entries until supply is absorbed.",
+    )
+    add_event("Inside Day", inside_day, "#f59e0b", 66, "Range compressed inside the prior candle.", "Compression can precede expansion; wait for direction.")
+    add_event("NR7", nr7, "#a855f7", 65, "Latest candle has the narrowest range in seven periods.", "Volatility is compressed; prepare for range expansion.")
+    add_event("Gap Up", gap_up, "#22c55e", 62, "Opening price was above the prior high.", "Gap strength needs acceptance, not immediate chasing.")
+    add_event("Gap Down", gap_down, "#f43f5e", 62, "Opening price was below the prior low.", "Risk is elevated unless price reclaims the gap zone.")
+    add_event(
+        "False Breakout Risk Zone",
+        false_breakout_zone,
+        "#dc2626",
+        int(coerce_float(chart.get("false_breakout_risk"), 65) or 65),
+        "False breakout risk is elevated from the chart model.",
+        "Demand confirmation is required before treating resistance as conquered.",
+    )
+    return pd.DataFrame(rows)
+
+
+def build_custom_ai_plotly_chart(
+    history: pd.DataFrame,
+    chart: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    feature_events: pd.DataFrame,
+    overlays: list[str],
+    theme: str,
+    symbol: str,
+    timeframe: str,
+) -> Any:
+    if go is None or make_subplots is None:
+        return None
+    visible = history.copy().dropna(subset=["date", "open", "high", "low", "close"])
+    if visible.empty:
+        return None
+
+    dark = theme == "Dark"
+    template = "plotly_dark" if dark else "plotly_white"
+    grid_color = "#334155" if dark else "#e2e8f0"
+    up_color = "#10b981"
+    down_color = "#f43f5e"
+    volume_colors = [up_color if close >= open_ else down_color for open_, close in zip(visible["open"], visible["close"])]
+
+    fig = make_subplots(
+        rows=4,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.035,
+        row_heights=[0.58, 0.16, 0.13, 0.13],
+        specs=[[{"secondary_y": False}], [{"secondary_y": False}], [{"secondary_y": False}], [{"secondary_y": False}]],
+    )
+    fig.add_trace(
+        go.Candlestick(
+            x=visible["date"],
+            open=visible["open"],
+            high=visible["high"],
+            low=visible["low"],
+            close=visible["close"],
+            name="OHLC",
+            increasing_line_color=up_color,
+            decreasing_line_color=down_color,
+            increasing_fillcolor=up_color,
+            decreasing_fillcolor=down_color,
+            hoverlabel={"namelength": -1},
+        ),
+        row=1,
+        col=1,
+    )
+
+    def add_line(column: str, name: str, color: str, width: float = 1.5, dash: str | None = None, row: int = 1) -> None:
+        if column not in visible.columns:
+            return
+        series = pd.to_numeric(visible[column], errors="coerce")
+        if series.dropna().empty:
+            return
+        fig.add_trace(
+            go.Scatter(
+                x=visible["date"],
+                y=series,
+                mode="lines",
+                line={"color": color, "width": width, "dash": dash or "solid"},
+                name=name,
+            ),
+            row=row,
+            col=1,
+        )
+
+    line_specs = {
+        "VWAP": ("vwap", "VWAP", "#0ea5e9", 1.6, "solid"),
+        "EMA20": ("ema20", "EMA20", "#22c55e", 1.5, "solid"),
+        "EMA50": ("ema50", "EMA50", "#f59e0b", 1.5, "solid"),
+        "EMA100": ("ema100", "EMA100", "#a855f7", 1.4, "solid"),
+        "EMA190": ("ema190", "EMA190", "#14b8a6", 1.3, "dash"),
+        "EMA200": ("ema200", "EMA200", "#ef4444", 1.7, "solid"),
+        "SMA20": ("sma20", "SMA20", "#84cc16", 1.2, "dot"),
+        "SMA50": ("sma50", "SMA50", "#f97316", 1.2, "dot"),
+        "SMA100": ("sma100", "SMA100", "#8b5cf6", 1.2, "dot"),
+        "SMA190": ("sma190", "SMA190", "#06b6d4", 1.2, "dash"),
+        "SMA200": ("sma200", "SMA200", "#64748b", 1.5, "dash"),
+        "SuperTrend": ("supertrend", "SuperTrend", "#22c55e", 1.5, "dash"),
+    }
+    for overlay, args in line_specs.items():
+        if overlay in overlays:
+            add_line(*args)
+
+    if "Bollinger Bands" in overlays:
+        add_line("bb_upper", "BB Upper", "#60a5fa", 1.1, "dot")
+        add_line("bb_lower", "BB Lower", "#60a5fa", 1.1, "dot")
+    if "Keltner Channel" in overlays:
+        add_line("keltner_upper", "Keltner Upper", "#facc15", 1.1, "dot")
+        add_line("keltner_lower", "Keltner Lower", "#facc15", 1.1, "dot")
+
+    if "Pivot Points" in overlays:
+        latest = visible.iloc[-1]
+        for column, label, color in [
+            ("pivot_point", "Pivot", "#64748b"),
+            ("pivot_r1", "R1", "#ef4444"),
+            ("pivot_r2", "R2", "#b91c1c"),
+            ("pivot_s1", "S1", "#10b981"),
+            ("pivot_s2", "S2", "#047857"),
+        ]:
+            value = coerce_float(latest.get(column), None)
+            if value is not None:
+                fig.add_hline(y=value, line_color=color, line_dash="dot", annotation_text=label, annotation_position="right", row=1, col=1)
+
+    if "AI Overlays" in overlays:
+        for annotation in annotations:
+            low = coerce_float(annotation.get("Low"), None)
+            high = coerce_float(annotation.get("High"), None)
+            color = annotation.get("Color", "#64748b")
+            kind = annotation.get("Kind")
+            label = str(annotation.get("Type", "AI Overlay"))
+            if low is None or high is None:
+                continue
+            if kind == "zone" and low != high:
+                fig.add_hrect(y0=low, y1=high, fillcolor=color, opacity=0.12, line_width=1, line_dash="dash", row=1, col=1)
+                fig.add_annotation(x=visible["date"].iloc[-1], y=high, text=label, showarrow=False, font={"color": color, "size": 11}, row=1, col=1)
+            else:
+                fig.add_hline(y=low, line_color=color, line_dash="dash", annotation_text=label, annotation_position="right", row=1, col=1)
+
+    if "Volume Profile" in overlays:
+        profile = custom_volume_profile(visible)
+        if not profile.empty:
+            top_profile = profile.head(3)
+            for _, row_profile in top_profile.iterrows():
+                fig.add_hrect(
+                    y0=row_profile["Low"],
+                    y1=row_profile["High"],
+                    fillcolor="#94a3b8",
+                    opacity=min(0.18, max(0.05, float(row_profile["Volume Share %"]) / 100)),
+                    line_width=0,
+                    row=1,
+                    col=1,
+                )
+
+    if "AI Annotations" in overlays and not feature_events.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=feature_events["Date"],
+                y=feature_events["Price"],
+                mode="markers+text",
+                marker={
+                    "size": 12,
+                    "color": feature_events["Color"],
+                    "symbol": "triangle-up",
+                    "line": {"color": "#ffffff", "width": 1},
+                },
+                text=feature_events["Event"],
+                textposition="top center",
+                customdata=feature_events[["Professional Interpretation", "Potential Implication", "Confidence Level"]],
+                hovertemplate="<b>%{text}</b><br>%{customdata[0]}<br>%{customdata[1]}<br>Confidence: %{customdata[2]}<extra></extra>",
+                name="AI Teaching Events",
+            ),
+            row=1,
+            col=1,
+        )
+
+    fig.add_trace(
+        go.Bar(x=visible["date"], y=visible["volume"], marker_color=volume_colors, name="Volume", opacity=0.72),
+        row=2,
+        col=1,
+    )
+    if "Average Volume" in overlays:
+        add_line("avg_volume_20", "Average Volume 20", "#eab308", 1.3, "dash", row=2)
+    add_line("rsi14", "RSI14", "#a855f7", 1.4, "solid", row=3)
+    fig.add_hline(y=70, line_color="#ef4444", line_dash="dot", row=3, col=1)
+    fig.add_hline(y=30, line_color="#22c55e", line_dash="dot", row=3, col=1)
+    add_line("macd", "MACD", "#0ea5e9", 1.4, "solid", row=4)
+    add_line("macd_signal", "Signal", "#f59e0b", 1.2, "solid", row=4)
+    fig.add_trace(
+        go.Bar(x=visible["date"], y=visible.get("macd_histogram", pd.Series(0, index=visible.index)), marker_color="#64748b", name="MACD Histogram", opacity=0.45),
+        row=4,
+        col=1,
+    )
+
+    fig.update_layout(
+        title=f"{symbol} Custom AI Chart Engine - {timeframe}",
+        template=template,
+        height=920,
+        hovermode="x unified",
+        dragmode="pan",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        margin={"l": 20, "r": 20, "t": 72, "b": 30},
+        xaxis_rangeslider_visible=False,
+    )
+    for axis in ["xaxis", "xaxis2", "xaxis3", "xaxis4", "yaxis", "yaxis2", "yaxis3", "yaxis4"]:
+        fig.update_layout({axis: {"gridcolor": grid_color}})
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0, 100])
+    fig.update_yaxes(title_text="MACD", row=4, col=1)
+    return fig
+
+
+def custom_chart_engine_score_panel(report: dict[str, Any], history: pd.DataFrame, feature_events: pd.DataFrame, data_source: str) -> pd.DataFrame:
+    chart = report.get("chart", {})
+    latest = history.iloc[-1] if not history.empty else pd.Series(dtype="object")
+    rows = [
+        {"Panel": "Data Source", "Reading": data_source, "Professional Interpretation": "The engine falls back through configured providers and never depends on TradingView."},
+        {"Panel": "Current Trend", "Reading": latest.get("trend_status", "Derived from EMAs"), "Professional Interpretation": "Trend is judged from price acceptance relative to EMA20/EMA50/EMA200 and structure."},
+        {"Panel": "Trend Stage", "Reading": chart.get("chart_stage", "Unavailable"), "Professional Interpretation": "Stage reading connects the current chart to accumulation, markup, distribution, or markdown behavior."},
+        {"Panel": "Market Structure", "Reading": chart.get("pattern_detected", "Unavailable"), "Professional Interpretation": "Patterns are useful only when price, volume, and risk location agree."},
+        {"Panel": "Buyer vs Seller Control", "Reading": "Buyers" if (coerce_float(latest.get("rsi14"), 50) or 50) >= 55 and (coerce_float(latest.get("rvol"), 0) or 0) >= 1 else "Balanced/unclear", "Professional Interpretation": "Control is inferred from close location, RSI, RVOL, OBV, and A/D line behavior."},
+        {"Panel": "Volume Analysis", "Reading": chart.get("volume_confirmation", "Unavailable"), "Professional Interpretation": f"Latest RVOL: {coerce_float(latest.get('rvol'), 0) or 0:.2f}. Volume must confirm price movement."},
+        {"Panel": "Institutional Activity", "Reading": chart.get("institutional_footprints", "Unavailable"), "Professional Interpretation": "Proxy uses delivery, OBV, A/D line, repeated tests, and volume expansion. True order flow requires a live feed."},
+        {"Panel": "Pattern Quality", "Reading": chart.get("pattern_reliability_score", "Unavailable"), "Professional Interpretation": "Higher pattern score means the visible setup has more supporting evidence."},
+        {"Panel": "False Breakout Risk", "Reading": chart.get("false_breakout_risk", "Unavailable"), "Professional Interpretation": "High false-breakout risk means wait for acceptance above resistance or a clean retest."},
+        {"Panel": "Teaching Events", "Reading": len(feature_events), "Professional Interpretation": "Highlighted candles teach what professionals are noticing on the chart."},
+    ]
+    return pd.DataFrame(rows)
+
+
+def render_custom_ai_chart_engine_page() -> None:
+    st.subheader("Custom AI Chart Engine")
+    st.caption("No TradingView dependency. The app loads OHLCV, calculates indicators internally, renders Plotly candlesticks, draws AI overlays, and syncs the chart with IQ-5000 analysis.")
+
+    if go is None or make_subplots is None:
+        st.error("Plotly is not installed. Install package requirements or redeploy with the updated requirements.txt.")
+        return
+
+    with st.sidebar:
+        st.header("Custom Chart Engine")
+        raw_symbol = st.text_input("Symbol / index", value="RELIANCE", key="custom_chart_symbol")
+        timeframe = st.selectbox("Timeframe", CUSTOM_CHART_TIMEFRAMES, index=2, key="custom_chart_timeframe")
+        provider = st.selectbox("Data provider", ["Auto Provider Fallback", "Yahoo Finance", "Uploaded CSV", "Zerodha Kite Placeholder", "NSE Bhavcopy Placeholder"], key="custom_chart_provider")
+        uploaded_file = st.file_uploader("Optional OHLCV CSV", type=["csv"], key="custom_chart_csv")
+        theme = st.radio("Theme", ["Dark", "Light"], index=0, horizontal=True, key="custom_chart_theme")
+        visible_candles = st.slider("Visible candles", 60, 500, 220, 20, key="custom_chart_visible")
+        overlays = st.multiselect(
+            "Chart overlays",
+            [
+                "VWAP",
+                "EMA20",
+                "EMA50",
+                "EMA100",
+                "EMA190",
+                "EMA200",
+                "SMA20",
+                "SMA50",
+                "SMA100",
+                "SMA190",
+                "SMA200",
+                "Bollinger Bands",
+                "Keltner Channel",
+                "SuperTrend",
+                "Pivot Points",
+                "Average Volume",
+                "Volume Profile",
+                "AI Overlays",
+                "AI Annotations",
+            ],
+            default=["VWAP", "EMA20", "EMA50", "EMA200", "Bollinger Bands", "SuperTrend", "Volume Profile", "AI Overlays", "AI Annotations", "Average Volume"],
+            key="custom_chart_overlays",
+        )
+        replay_mode = st.toggle("Replay mode: hide future candles", value=False, key="custom_chart_replay_mode")
+        capital = st.number_input("Trading capital", min_value=10_000.0, value=500_000.0, step=50_000.0, key="custom_chart_capital")
+        risk_pct = st.slider("Max risk per idea %", 0.25, 5.0, 1.0, 0.25, key="custom_chart_risk")
+        if st.button("Refresh custom chart engine", type="primary", width="stretch"):
+            fetch_ohlcv_history.clear()
+            fetch_interval_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            fetch_ticker_info.clear()
+            st.rerun()
+
+    symbol = normalize_custom_chart_symbol(raw_symbol)
+    if not symbol:
+        st.info("Enter an NSE symbol or index alias such as RELIANCE, SBIN, NIFTY, BANKNIFTY, or upload a CSV.")
+        return
+
+    with st.expander("Data Provider Priority", expanded=False):
+        display_dataframe(pd.DataFrame(CUSTOM_CHART_PROVIDER_PRIORITY, columns=["Priority Source", "Status"]))
+
+    raw_history, data_source = load_custom_chart_engine_history(symbol, timeframe, provider, uploaded_file)
+    history = add_custom_chart_engine_indicators(raw_history)
+    if history.empty:
+        st.info(f"No usable OHLCV data found. Provider status: {data_source}. Try Daily timeframe or upload a CSV with date, open, high, low, close, volume columns.")
+        return
+
+    replay_future = pd.DataFrame()
+    replay_selected_date = None
+    if replay_mode:
+        dates = pd.to_datetime(history["date"], errors="coerce").dropna().sort_values()
+        if len(dates) < 80:
+            st.warning("Replay needs more historical candles. Disable replay or use a longer timeframe/history source.")
+        else:
+            min_date = dates.iloc[min(40, len(dates) - 1)].date()
+            max_date = dates.iloc[max(0, len(dates) - 21)].date()
+            default_date = dates.iloc[max(0, len(dates) - 60)].date()
+            replay_selected_date = st.date_input("Replay cutoff date", value=default_date, min_value=min_date, max_value=max_date, key="custom_chart_replay_date")
+            past, future, selected_ts = prepare_replay_history(history, replay_selected_date)
+            if not past.empty:
+                history = add_custom_chart_engine_indicators(past)
+                replay_future = future
+                st.caption(f"Replay locked to data available up to {selected_ts.date() if selected_ts is not None else replay_selected_date}. Future candles are hidden from the chart and analysis.")
+
+    analysis_history = history.tail(max(visible_candles, 220)).copy()
+    visible_history = history.tail(visible_candles).copy()
+    with st.spinner("Calculating custom indicators, AI overlays, and institutional analysis..."):
+        report = build_professional_chart_report(symbol, capital=capital, risk_pct=risk_pct, daily_history_override=analysis_history, replay_mode=replay_mode)
+    if not report:
+        st.info("The chart rendered, but the professional report could not be generated.")
+        report = {
+            "chart": score_ai_chart_reading_candidate(pd.Series({"nsecode": symbol, "name": symbol}), history_override=analysis_history),
+            "summary": {},
+            "plan": pd.DataFrame(),
+            "scores": pd.DataFrame(),
+            "timeframes": pd.DataFrame(),
+            "verdict": "Research only",
+        }
+
+    chart = report.get("chart", {})
+    annotations = build_chart_teacher_annotations(chart, visible_history)
+    feature_events = custom_chart_feature_events(visible_history, chart)
+    fig = build_custom_ai_plotly_chart(visible_history, chart, annotations, feature_events, overlays, theme, symbol, timeframe)
+
+    metric_a, metric_b, metric_c, metric_d, metric_e = st.columns(5)
+    metric_a.metric("Data Source", data_source)
+    metric_b.metric("Current Price", chart.get("current_price", "Unavailable"))
+    metric_c.metric("Chart Quality", int(coerce_float(chart.get("chart_quality_score"), 0) or 0))
+    metric_d.metric("Trade Probability", report.get("summary", {}).get("Expected Probability", "Unavailable"))
+    metric_e.metric("False Breakout Risk", chart.get("false_breakout_risk", "Unavailable"))
+
+    chart_tab, analysis_tab, plan_tab, replay_tab, data_tab = st.tabs(
+        ["AI Chart", "Live AI Analysis", "Trading Plan", "Replay / Teacher", "Data & Indicators"]
+    )
+
+    with chart_tab:
+        if fig is None:
+            st.info("Plotly chart could not be created from the current data.")
+        else:
+            config = {
+                "displaylogo": False,
+                "scrollZoom": True,
+                "responsive": True,
+                "modeBarButtonsToAdd": ["drawline", "drawrect", "eraseshape"],
+                "toImageButtonOptions": {
+                    "format": "png",
+                    "filename": f"{symbol}_{timeframe}_custom_ai_chart",
+                    "height": 1200,
+                    "width": 1800,
+                    "scale": 2,
+                },
+            }
+            st.plotly_chart(fig, width="stretch", config=config)
+            html_bytes = fig.to_html(include_plotlyjs="cdn", full_html=True).encode("utf-8")
+            col_a, col_b = st.columns(2)
+            col_a.download_button("Export interactive chart HTML", html_bytes, file_name=f"{symbol}_custom_ai_chart.html", mime="text/html", width="stretch")
+            try:
+                pdf_bytes = fig.to_image(format="pdf")
+                col_b.download_button("Export chart PDF", pdf_bytes, file_name=f"{symbol}_custom_ai_chart.pdf", mime="application/pdf", width="stretch")
+            except Exception:
+                col_b.caption("PDF export requires Kaleido. PNG export is available from the Plotly toolbar.")
+
+    with analysis_tab:
+        display_dataframe(custom_chart_engine_score_panel(report, visible_history, feature_events, data_source), height=430)
+        st.markdown("**Professional Report**")
+        render_professional_report_tabs(report, height=330)
+
+    with plan_tab:
+        display_dataframe(report.get("plan", pd.DataFrame()), height=420)
+        st.caption("This is research and planning output. Final execution still requires live confirmation, liquidity, and risk discipline.")
+
+    with replay_tab:
+        st.markdown("**AI Visual Teacher Events**")
+        if feature_events.empty:
+            st.info("No special teaching candle was detected on the latest visible candle.")
+        else:
+            display_dataframe(feature_events.drop(columns=["Color"], errors="ignore"), height=360)
+        if replay_mode and not replay_future.empty:
+            st.markdown("**Future Outcome Check**")
+            outcome = evaluate_chart_replay_outcome(replay_future, chart)
+            display_dataframe(outcome.get("outcomes", pd.DataFrame()), height=260)
+            display_dataframe(outcome.get("summary", pd.DataFrame()), height=300)
+        elif replay_mode:
+            st.info("No future candles are available after the selected replay date.")
+
+    with data_tab:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Indicator Snapshot**")
+            display_dataframe(chart_teacher_indicator_snapshot(visible_history), height=520)
+        with right:
+            st.markdown("**Volume Profile**")
+            display_dataframe(custom_volume_profile(visible_history), height=520)
+        with st.expander("Raw visible OHLCV + indicators"):
+            display_dataframe(visible_history.tail(250), height=520)
+
+
 ADVANCED_IQ_MODULES: dict[int, str] = {
     23: "M23 - AI Order Flow Engine",
     24: "M24 - AI Institutional Portfolio Tracker",
@@ -7914,6 +8541,9 @@ def main() -> None:
         return
     if selected_page == "AI Chart Reading Engine":
         render_ai_chart_reading_page()
+        return
+    if selected_page == "AI Custom Chart Engine":
+        render_custom_ai_chart_engine_page()
         return
     if selected_page == "AI Professional Chart Interpretation":
         render_professional_chart_interpretation_page()
