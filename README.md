@@ -1,6 +1,6 @@
 # IQ-5000 NSE Intelligence Platform
 
-Deploy-ready Streamlit package for NSE stock screening, breakout probability scoring, hedge-fund style SWOT analysis, IQ-5000 research workflows, IQ Modules 23-40, professional chart interpretation, no-TradingView custom Plotly charting, interactive visual chart teaching, chart replay validation, and stock technical/SWOT cards.
+Deploy-ready Streamlit package for NSE stock screening, breakout probability scoring, hedge-fund style SWOT analysis, IQ-5000 research workflows, auto-fetched IQ Modules 23-40, professional chart interpretation, no-TradingView custom Plotly charting, interactive visual chart teaching, chart replay validation, and stock technical/SWOT cards.
 
 ## Files
 

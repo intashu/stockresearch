@@ -7829,6 +7829,14 @@ ADVANCED_IQ_MODULES: dict[int, str] = {
 }
 ADVANCED_IQ_MODULE_LOOKUP = {label: module for module, label in ADVANCED_IQ_MODULES.items()}
 ADVANCED_DEFAULT_WATCHLIST = "RELIANCE, SBIN, HDFCBANK, ICICIBANK, BEL, HAL, LT, TRENT, CDSL, TCS, INFY, WABAG"
+ADVANCED_AUTO_SCAN_SOURCES: dict[str, str] = {
+    "AI Early Breakout Universe": AI_EARLY_BREAKOUT_CLAUSE,
+    "AI Chart Reading Universe": AI_CHART_READING_CLAUSE,
+    "AI Overnight Opportunity Universe": AI_OVERNIGHT_OPPORTUNITY_CLAUSE,
+    "Institutional Setup Universe": INSTITUTIONAL_SETUP_CLAUSE,
+    "Breakout Probability Universe": BREAKOUT_PROBABILITY_CLAUSE,
+    "200 EMA/SMA Launch Pad Universe": LAUNCH_PAD_200_CLAUSE,
+}
 ADVANCED_SECTOR_BASKETS: dict[str, list[str]] = {
     "Auto": ["M&M", "TATAMOTORS", "MARUTI"],
     "Banks": ["HDFCBANK", "ICICIBANK", "SBIN"],
@@ -8200,6 +8208,242 @@ def opportunity_ranking_table(symbols: list[str], capital: float, risk_pct: floa
     return safe_sort_dataframe(pd.DataFrame(rows), ["AI IQ Score", "High Conviction"], [False, False])
 
 
+def advanced_symbols_from_scan_results(df: pd.DataFrame, limit: int) -> list[str]:
+    if df.empty:
+        return []
+    symbol_column = find_column(df, ["nsecode", "symbol", "stock", "stock_name", "name"])
+    if symbol_column is None:
+        return []
+    symbols: list[str] = []
+    for value in df[symbol_column].dropna().astype(str):
+        cleaned = value.strip().upper().replace(".NS", "")
+        cleaned = re.sub(r"[^A-Z0-9&_-]+", "", cleaned)
+        if cleaned and cleaned not in symbols:
+            symbols.append(cleaned)
+        if len(symbols) >= limit:
+            break
+    return symbols
+
+
+def render_auto_universe_controls(module_key: int, default_limit: int = 10) -> tuple[list[str], float, float, str, pd.DataFrame]:
+    with st.sidebar:
+        st.header("Auto Stock Universe")
+        scan_source = st.selectbox(
+            "Auto-fetch source",
+            list(ADVANCED_AUTO_SCAN_SOURCES),
+            index=0,
+            key=f"advanced_auto_source_{module_key}",
+        )
+        candidate_limit = st.slider("Stocks to analyze", 3, 30, default_limit, 1, key=f"advanced_auto_limit_{module_key}")
+        include_manual = st.toggle("Add manual symbols", value=False, key=f"advanced_auto_include_manual_{module_key}")
+        manual_symbols = ""
+        if include_manual:
+            manual_symbols = st.text_area(
+                "Manual symbols",
+                value=ADVANCED_DEFAULT_WATCHLIST,
+                height=90,
+                key=f"advanced_auto_manual_{module_key}",
+            )
+        capital = st.number_input(
+            "Trading capital",
+            min_value=10_000.0,
+            value=500_000.0,
+            step=50_000.0,
+            key=f"advanced_auto_capital_{module_key}",
+        )
+        risk_pct = st.slider("Max risk per idea %", 0.25, 5.0, 1.0, 0.25, key=f"advanced_auto_risk_{module_key}")
+        if st.button("Refresh auto universe", type="primary", width="stretch", key=f"advanced_auto_refresh_{module_key}"):
+            run_scan.clear()
+            fetch_ohlcv_history.clear()
+            fetch_interval_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            fetch_ticker_info.clear()
+            fetch_raw_yfinance_history.clear()
+            st.rerun()
+
+    scan_df, scan_error = run_scan(ADVANCED_AUTO_SCAN_SOURCES[scan_source])
+    if scan_error:
+        st.warning(f"Auto-fetch source returned an error: {scan_error}")
+    symbols = advanced_symbols_from_scan_results(scan_df, candidate_limit)
+    if include_manual:
+        for symbol in parse_advanced_symbols(manual_symbols, limit=candidate_limit):
+            if symbol not in symbols:
+                symbols.append(symbol)
+            if len(symbols) >= candidate_limit:
+                break
+    if not symbols:
+        st.info("Auto-fetch returned no symbols, so the module is using the default liquid watchlist.")
+        symbols = parse_advanced_symbols(ADVANCED_DEFAULT_WATCHLIST, limit=candidate_limit)
+    return symbols[:candidate_limit], capital, risk_pct, scan_source, scan_df
+
+
+def render_auto_universe_metrics(symbols: list[str], scan_source: str, scan_df: pd.DataFrame) -> None:
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Auto Source", scan_source)
+    col_b.metric("Fetched Rows", len(scan_df))
+    col_c.metric("Stocks Analyzed", len(symbols))
+    with st.expander("Auto-fetched symbols", expanded=False):
+        display_dataframe(pd.DataFrame({"Symbol": symbols}), height=220)
+
+
+def build_advanced_contexts(symbols: list[str], capital: float, risk_pct: float) -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    for symbol in symbols:
+        try:
+            contexts.append(advanced_stock_context(symbol, capital=capital, risk_pct=risk_pct))
+        except Exception as exc:
+            contexts.append(
+                {
+                    "symbol": symbol,
+                    "metrics": {"status": f"Skipped: {exc}"},
+                    "chart": {},
+                    "early": {},
+                    "iq": {},
+                    "overnight": {},
+                    "market": compute_iq5000_market_regime(),
+                    "delivery": {},
+                    "info": {},
+                }
+            )
+    return contexts
+
+
+def context_common_fields(context: dict[str, Any]) -> dict[str, Any]:
+    metrics = context.get("metrics", {})
+    chart = context.get("chart", {})
+    iq = context.get("iq", {})
+    early = context.get("early", {})
+    overnight = context.get("overnight", {})
+    return {
+        "Stock": context.get("symbol"),
+        "Price": metrics.get("current_price", chart.get("current_price")),
+        "Trend": metrics.get("trend_status"),
+        "Chart Score": chart.get("chart_quality_score"),
+        "AI IQ Score": iq.get("ai_iq_score"),
+        "Early Breakout": early.get("ai_early_breakout_score"),
+        "Smart Money": iq.get("smart_money_score", early.get("smart_money_score")),
+        "Tomorrow Probability": overnight.get("tomorrow_intraday_probability"),
+        "Turnover Cr": metrics.get("turnover_cr", early.get("turnover_cr")),
+        "Reason": chart.get("reason", iq.get("reason_for_selection", early.get("reason_for_selection", ""))),
+    }
+
+
+def module23_order_flow_universe(contexts: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for context in contexts:
+        common = context_common_fields(context)
+        table = advanced_order_flow_table(context)
+        score_map = dict(zip(table["Output"], table["Score"])) if not table.empty else {}
+        reading_map = dict(zip(table["Output"], table["Reading"])) if not table.empty else {}
+        rows.append(
+            {
+                **common,
+                "Buyer Dominance": score_map.get("Buyer Dominance"),
+                "Seller Dominance": score_map.get("Seller Dominance"),
+                "Absorption": score_map.get("Absorption"),
+                "Liquidity Grab": score_map.get("Liquidity Grab"),
+                "Smart Money Activity": score_map.get("Smart Money Activity"),
+                "Order Flow Read": reading_map.get("Smart Money Activity", "Unavailable"),
+            }
+        )
+    return safe_sort_dataframe(pd.DataFrame(rows), ["Smart Money Activity", "Buyer Dominance", "Chart Score"], [False, False, False])
+
+
+def module24_institutional_universe(contexts: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for context in contexts:
+        common = context_common_fields(context)
+        delivery_pct = coerce_float(context.get("delivery", {}).get("delivery_percentage"), coerce_float(context.get("early", {}).get("delivery_pct"), 0)) or 0
+        institutional_score = coerce_float(context.get("iq", {}).get("ai_institutional_score"), 0) or 0
+        conviction = bounded_score(
+            (40 if delivery_pct >= 60 else 30 if delivery_pct >= 50 else 18 if delivery_pct >= 40 else 8)
+            + institutional_score * 0.40
+            + (coerce_float(context.get("iq", {}).get("smart_money_score"), 0) or 0) * 0.25,
+            100,
+        )
+        rows.append(
+            {
+                **common,
+                "Delivery %": round(delivery_pct, 2) if delivery_pct else None,
+                "Institutional Score": institutional_score,
+                "Institutional Conviction": conviction,
+                "Accumulation Trend": "Accumulation" if conviction >= 70 else "Neutral" if conviction >= 45 else "Weak",
+            }
+        )
+    return safe_sort_dataframe(pd.DataFrame(rows), ["Institutional Conviction", "Institutional Score"], [False, False])
+
+
+def module29_market_dna_universe(contexts: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for context in contexts:
+        common = context_common_fields(context)
+        iq = context.get("iq", {})
+        dna = market_dna_table(context)
+        dna_map = dict(zip(dna["DNA Field"], dna["Value"])) if not dna.empty else {}
+        rows.append(
+            {
+                **common,
+                "Detected Pattern": dna_map.get("Detected Pattern"),
+                "Similarity Score": iq.get("similarity_score"),
+                "Historical Win Rate": dna_map.get("Historical Win Rate"),
+                "Historical Average Return": dna_map.get("Historical Average Return"),
+                "Average Breakout Time": dna_map.get("Average Breakout Time"),
+            }
+        )
+    return safe_sort_dataframe(pd.DataFrame(rows), ["Similarity Score", "Historical Win Rate", "Chart Score"], [False, False, False])
+
+
+def module30_trade_coach_universe(contexts: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for context in contexts:
+        common = context_common_fields(context)
+        chart = context.get("chart", {})
+        iq = context.get("iq", {})
+        action = (
+            "Eligible for watchlist confirmation"
+            if (coerce_float(common.get("AI IQ Score"), 0) or 0) >= 800 or (coerce_float(common.get("Chart Score"), 0) or 0) >= 80
+            else "Research only / wait"
+        )
+        rows.append(
+            {
+                **common,
+                "Coach Action": action,
+                "What Confirms": "VWAP hold, breakout/retest acceptance, RVOL expansion, and market regime support.",
+                "What Invalidates": f"Failure below stop/retest zone. Stop: {iq.get('stop_loss', chart.get('stop_loss', 'Unavailable'))}",
+                "Professional Lesson": "Define invalidation before entry; no clean risk level means no trade.",
+            }
+        )
+    return safe_sort_dataframe(pd.DataFrame(rows), ["AI IQ Score", "Chart Score"], [False, False])
+
+
+def module35_scenario_universe(contexts: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for context in contexts:
+        common = context_common_fields(context)
+        base_prob = coerce_float(context.get("iq", {}).get("trade_probability"), coerce_float(context.get("chart", {}).get("chart_quality_score"), 50)) or 50
+        bull = bounded_score(base_prob * 0.70 + 20, 100)
+        sideways = bounded_score(35 - abs(base_prob - 60) * 0.25, 100)
+        bear = max(0, 100 - bull - sideways)
+        rows.append({**common, "Bull Scenario %": bull, "Sideways %": sideways, "Bear Scenario %": bear, "Preferred Mode": "Bullish continuation" if bull >= 65 else "Wait / range" if sideways >= bear else "Defensive"})
+    return safe_sort_dataframe(pd.DataFrame(rows), ["Bull Scenario %", "AI IQ Score"], [False, False])
+
+
+def module40_master_brain_universe(contexts: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for context in contexts:
+        common = context_common_fields(context)
+        final_score = bounded_score(
+            (coerce_float(context.get("iq", {}).get("ai_iq_score"), 0) or 0) / 10 * 0.35
+            + (coerce_float(context.get("chart", {}).get("chart_quality_score"), 0) or 0) * 0.20
+            + (coerce_float(context.get("early", {}).get("ai_early_breakout_score"), 0) or 0) * 0.20
+            + (coerce_float(context.get("overnight", {}).get("tomorrow_intraday_probability"), 0) or 0) * 0.15
+            + (coerce_float(context.get("market", {}).get("market_regime_score"), 60) or 60) * 0.10,
+            100,
+        )
+        rows.append({**common, "Master Brain Score": final_score, "Decision": "High-quality watchlist" if final_score >= 80 else "Monitor" if final_score >= 60 else "No trade / research only"})
+    return safe_sort_dataframe(pd.DataFrame(rows), ["Master Brain Score", "AI IQ Score", "Chart Score"], [False, False, False])
+
+
 def render_module_symbol_controls(default_symbol: str = "RELIANCE") -> tuple[str, float, float]:
     with st.sidebar:
         st.header("Module Controls")
@@ -8245,7 +8489,7 @@ def render_advanced_iq_module_page(module_key: int) -> None:
     st.subheader(title)
 
     if module_key in {25, 26, 27}:
-        st.caption("Macro/sector module. Uses available yfinance/price proxies and labels unavailable institutional feeds clearly.")
+        st.caption("Auto-fetches macro and sector evidence. Uses available yfinance/price proxies and labels unavailable institutional feeds clearly.")
         if module_key == 25:
             table = global_correlation_table()
             risk_score = bounded_score(
@@ -8283,202 +8527,193 @@ def render_advanced_iq_module_page(module_key: int) -> None:
         display_dataframe(sector_table, height=560)
         return
 
-    if module_key in {28, 38, 39}:
-        symbols, capital, risk_pct = render_watchlist_controls(module_key)
-        if not symbols:
-            st.info("Enter at least one NSE symbol.")
-            return
+    default_limit = 8 if module_key in {23, 24, 29, 30, 31, 35, 37, 40} else 12
+    symbols, capital, risk_pct, scan_source, scan_df = render_auto_universe_controls(module_key, default_limit=default_limit)
+    render_auto_universe_metrics(symbols, scan_source, scan_df)
+    if not symbols:
+        st.info("No stocks are available for this module after auto-fetch.")
+        return
+
+    if module_key in {28, 38, 39, 32, 33, 34, 36, 37}:
         if module_key == 28:
             table = relative_performance_matrix(symbols)
-            st.caption("Ranks each stock against NIFTY using 20D/60D relative performance and trend quality.")
+            st.caption("Auto-ranks fetched stocks against NIFTY using 20D/60D relative performance and trend quality.")
             display_dataframe(table, height=620)
             return
+
         table = opportunity_ranking_table(symbols, capital, risk_pct)
+
         if module_key == 38:
             radar = table.copy()
-            radar["Radar Signal"] = radar.apply(
-                lambda row: "Elite setup entering radar" if coerce_float(row.get("AI IQ Score"), 0) >= 850 else "Monitor" if coerce_float(row.get("High Conviction"), 0) >= 65 else "Research only",
-                axis=1,
-            )
+            if not radar.empty:
+                radar["Radar Signal"] = radar.apply(
+                    lambda row: "Elite setup entering radar" if coerce_float(row.get("AI IQ Score"), 0) >= 850 else "Monitor" if coerce_float(row.get("High Conviction"), 0) >= 65 else "Research only",
+                    axis=1,
+                )
             display_dataframe(radar, height=640)
             return
+
         display_dataframe(table.head(25), height=640)
-        st.download_button(
-            "Download opportunity ranking CSV",
-            table.to_csv(index=False).encode("utf-8"),
-            file_name="ai_opportunity_ranking.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        return
 
-    if module_key == 32:
-        symbols, capital, risk_pct = render_watchlist_controls(module_key)
-        table = opportunity_ranking_table(symbols, capital, risk_pct)
-        total_risk_budget = capital * risk_pct / 100
-        active = table[pd.to_numeric(table.get("AI IQ Score", pd.Series(dtype="float64")), errors="coerce") >= 800] if not table.empty else pd.DataFrame()
-        col_a, col_b, col_c, col_d = st.columns(4)
-        col_a.metric("Portfolio Capital", f"{capital:,.0f}")
-        col_b.metric("Risk Budget", f"{total_risk_budget:,.0f}")
-        col_c.metric("Qualified Ideas", len(active))
-        col_d.metric("Cash Mode", "High" if active.empty else "Selective")
-        allocation_rows = []
-        per_idea = total_risk_budget / max(len(active), 1)
-        for _, row in active.head(8).iterrows():
-            allocation_rows.append({"Stock": row.get("Stock"), "AI IQ Score": row.get("AI IQ Score"), "Max Rupee Risk": round(per_idea, 2), "Allocation Note": "Risk sized equally across qualified ideas"})
-        display_dataframe(pd.DataFrame(allocation_rows), height=300)
-        st.markdown("**Portfolio Opportunity Table**")
-        display_dataframe(table, height=520)
-        return
+        if module_key == 39:
+            st.download_button(
+                "Download opportunity ranking CSV",
+                table.to_csv(index=False).encode("utf-8"),
+                file_name="ai_opportunity_ranking.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+            return
 
-    if module_key == 33:
-        if "advanced_trade_journal" not in st.session_state:
-            st.session_state["advanced_trade_journal"] = pd.DataFrame(columns=["Date", "Stock", "Reason", "Emotion", "Mistake", "Lesson", "Result"])
-        with st.form("advanced_trade_journal_form"):
-            col_a, col_b, col_c = st.columns(3)
-            trade_date = col_a.date_input("Trade date", value=date.today())
-            stock = col_b.text_input("Stock", value="RELIANCE")
-            result = col_c.text_input("Result", value="Open / P&L")
-            reason = st.text_area("Chart reason")
-            emotion = st.text_area("Emotion / behavior")
-            mistake = st.text_area("Mistakes")
-            lesson = st.text_area("Lesson")
-            submitted = st.form_submit_button("Save journal entry")
-        if submitted:
-            row = pd.DataFrame([{"Date": trade_date.isoformat(), "Stock": stock.upper(), "Reason": reason, "Emotion": emotion, "Mistake": mistake, "Lesson": lesson, "Result": result}])
-            st.session_state["advanced_trade_journal"] = pd.concat([st.session_state["advanced_trade_journal"], row], ignore_index=True)
-            st.success("Trade journal entry saved in session memory.")
-        journal = st.session_state["advanced_trade_journal"]
-        display_dataframe(journal, height=420)
-        if not journal.empty:
-            st.download_button("Download trade journal CSV", journal.to_csv(index=False).encode("utf-8"), "ai_trade_journal.csv", "text/csv", width="stretch")
-        return
+        if module_key == 32:
+            total_risk_budget = capital * risk_pct / 100
+            active = table[pd.to_numeric(table.get("AI IQ Score", pd.Series(dtype="float64")), errors="coerce") >= 800] if not table.empty else pd.DataFrame()
+            col_a, col_b, col_c, col_d = st.columns(4)
+            col_a.metric("Portfolio Capital", f"{capital:,.0f}")
+            col_b.metric("Risk Budget", f"{total_risk_budget:,.0f}")
+            col_c.metric("Qualified Ideas", len(active))
+            col_d.metric("Cash Mode", "High" if active.empty else "Selective")
+            allocation_rows = []
+            per_idea = total_risk_budget / max(len(active), 1)
+            for _, row in active.head(8).iterrows():
+                allocation_rows.append({"Stock": row.get("Stock"), "AI IQ Score": row.get("AI IQ Score"), "Max Rupee Risk": round(per_idea, 2), "Allocation Note": "Risk sized equally across qualified ideas"})
+            st.markdown("**Auto Portfolio Allocation Draft**")
+            display_dataframe(pd.DataFrame(allocation_rows), height=300)
+            return
 
-    if module_key == 34:
-        with st.sidebar:
-            trades_today = st.number_input("Trades taken today", min_value=0, value=0, step=1, key="psych_trades_today")
-            loss_streak = st.number_input("Current loss streak", min_value=0, value=0, step=1, key="psych_loss_streak")
-            daily_risk_used = st.slider("Daily risk used %", 0.0, 10.0, 0.0, 0.25, key="psych_risk_used")
-            urge = st.slider("Urge to trade / FOMO", 0, 10, 3, 1, key="psych_urge")
-        risk = bounded_score(trades_today * 10 + loss_streak * 15 + daily_risk_used * 8 + urge * 5, 100)
-        status = "Take a break" if risk >= 75 else "Defensive mode" if risk >= 55 else "Stable"
-        rows = [
-            {"Psychology Check": "Revenge Trading", "Status": "High risk" if loss_streak >= 3 or urge >= 8 else "Controlled", "Coach Note": "Do not trade to recover losses. Trade only valid setups."},
-            {"Psychology Check": "Overtrading", "Status": "High risk" if trades_today >= 5 else "Controlled", "Coach Note": "Professionals are paid for quality decisions, not activity."},
-            {"Psychology Check": "Daily Risk", "Status": "Exceeded" if daily_risk_used >= 3 else "Within limit", "Coach Note": "Stop trading when daily risk is consumed."},
-            {"Psychology Check": "FOMO", "Status": "High" if urge >= 7 else "Normal", "Coach Note": "If the setup is missed, wait for the next clean structure."},
-            {"Psychology Check": "Final Psychology Status", "Status": status, "Coach Note": "Capital protection is part of edge."},
-        ]
-        st.metric("Psychology Risk Score", risk)
-        display_dataframe(pd.DataFrame(rows), height=360)
-        return
+        if module_key == 33:
+            st.markdown("**Auto Journal Prompts From Fetched Stocks**")
+            journal_prompts = []
+            for _, row in table.head(10).iterrows():
+                journal_prompts.append(
+                    {
+                        "Stock": row.get("Stock"),
+                        "Prompt": "Write why this setup deserves attention before entering. Record confirmation, invalidation, emotion, and planned risk.",
+                        "Required Trigger": "VWAP/ORB/RVOL confirmation and clean stop level.",
+                        "Risk Note": row.get("Classification", "Research only"),
+                    }
+                )
+            display_dataframe(pd.DataFrame(journal_prompts), height=320)
+            if "advanced_trade_journal" not in st.session_state:
+                st.session_state["advanced_trade_journal"] = pd.DataFrame(columns=["Date", "Stock", "Reason", "Emotion", "Mistake", "Lesson", "Result"])
+            default_stock = str(table.iloc[0]["Stock"]) if not table.empty and "Stock" in table.columns else symbols[0]
+            with st.form("advanced_trade_journal_form"):
+                col_a, col_b, col_c = st.columns(3)
+                trade_date = col_a.date_input("Trade date", value=date.today())
+                stock = col_b.text_input("Stock", value=default_stock)
+                result = col_c.text_input("Result", value="Open / P&L")
+                reason = st.text_area("Chart reason")
+                emotion = st.text_area("Emotion / behavior")
+                mistake = st.text_area("Mistakes")
+                lesson = st.text_area("Lesson")
+                submitted = st.form_submit_button("Save journal entry")
+            if submitted:
+                row = pd.DataFrame([{"Date": trade_date.isoformat(), "Stock": stock.upper(), "Reason": reason, "Emotion": emotion, "Mistake": mistake, "Lesson": lesson, "Result": result}])
+                st.session_state["advanced_trade_journal"] = pd.concat([st.session_state["advanced_trade_journal"], row], ignore_index=True)
+                st.success("Trade journal entry saved in session memory.")
+            journal = st.session_state["advanced_trade_journal"]
+            display_dataframe(journal, height=320)
+            if not journal.empty:
+                st.download_button("Download trade journal CSV", journal.to_csv(index=False).encode("utf-8"), "ai_trade_journal.csv", "text/csv", width="stretch")
+            return
 
-    if module_key == 36:
-        scenario = st.selectbox("Historical scenario", ["2008 Global Crisis", "2020 COVID Crash", "2020-2021 Rally", "2022 Bear Market", "2024 Bull Run"], key="replay_scenario")
-        rows = [
-            {"Replay Scenario": scenario, "Training Focus": "Practice entries without hindsight", "Rule": "Hide future candles, write thesis first, reveal outcome after."},
-            {"Replay Step": "1", "Training Focus": "Identify market regime", "Rule": "Do not use future news or final chart outcome."},
-            {"Replay Step": "2", "Training Focus": "Mark support, resistance, trend, volume", "Rule": "Write invalidation before entry."},
-            {"Replay Step": "3", "Training Focus": "Reveal 5/10/20 sessions", "Rule": "Score whether your thesis, not only P&L, was correct."},
-        ]
-        display_dataframe(pd.DataFrame(rows), height=300)
-        st.info("For stock-specific no-lookahead replay, use the existing AI Chart Reading & Replay page.")
-        return
+        if module_key == 34:
+            with st.sidebar:
+                trades_today = st.number_input("Trades taken today", min_value=0, value=0, step=1, key="psych_trades_today")
+                loss_streak = st.number_input("Current loss streak", min_value=0, value=0, step=1, key="psych_loss_streak")
+                daily_risk_used = st.slider("Daily risk used %", 0.0, 10.0, 0.0, 0.25, key="psych_risk_used")
+                urge = st.slider("Urge to trade / FOMO", 0, 10, 3, 1, key="psych_urge")
+            best_iq = pd.to_numeric(table.get("AI IQ Score", pd.Series(dtype="float64")), errors="coerce").max() if not table.empty else 0
+            market_quality_penalty = 20 if pd.isna(best_iq) or best_iq < 750 else 0
+            risk = bounded_score(trades_today * 10 + loss_streak * 15 + daily_risk_used * 8 + urge * 5 + market_quality_penalty, 100)
+            status = "Take a break" if risk >= 75 else "Defensive mode" if risk >= 55 else "Stable"
+            rows = [
+                {"Psychology Check": "Auto Market Quality", "Status": "Low quality" if market_quality_penalty else "Acceptable", "Coach Note": "If fetched opportunities are weak, forcing trades is a behavior error."},
+                {"Psychology Check": "Revenge Trading", "Status": "High risk" if loss_streak >= 3 or urge >= 8 else "Controlled", "Coach Note": "Do not trade to recover losses. Trade only valid setups."},
+                {"Psychology Check": "Overtrading", "Status": "High risk" if trades_today >= 5 else "Controlled", "Coach Note": "Professionals are paid for quality decisions, not activity."},
+                {"Psychology Check": "Daily Risk", "Status": "Exceeded" if daily_risk_used >= 3 else "Within limit", "Coach Note": "Stop trading when daily risk is consumed."},
+                {"Psychology Check": "FOMO", "Status": "High" if urge >= 7 else "Normal", "Coach Note": "If the setup is missed, wait for the next clean structure."},
+                {"Psychology Check": "Final Psychology Status", "Status": status, "Coach Note": "Capital protection is part of edge."},
+            ]
+            st.metric("Psychology Risk Score", risk)
+            display_dataframe(pd.DataFrame(rows), height=390)
+            return
 
-    symbol, capital, risk_pct = render_module_symbol_controls()
-    if not symbol:
-        st.info("Enter an NSE symbol.")
-        return
-    context = advanced_stock_context(symbol, capital=capital, risk_pct=risk_pct)
-    render_advanced_module_summary(context)
+        if module_key == 36:
+            scenario = st.selectbox("Historical scenario", ["Auto Candidate Replay", "2008 Global Crisis", "2020 COVID Crash", "2020-2021 Rally", "2022 Bear Market", "2024 Bull Run"], key="replay_scenario")
+            selected_symbol = st.selectbox("Replay candidate from auto universe", symbols, key="auto_replay_candidate")
+            rows = [
+                {"Replay Scenario": scenario, "Stock": selected_symbol, "Training Focus": "Practice entries without hindsight", "Rule": "Hide future candles, write thesis first, reveal outcome after."},
+                {"Replay Scenario": scenario, "Stock": selected_symbol, "Training Focus": "Mark support, resistance, trend, volume", "Rule": "Write invalidation before entry."},
+                {"Replay Scenario": scenario, "Stock": selected_symbol, "Training Focus": "Reveal 5/10/20 sessions", "Rule": "Score whether your thesis, not only P&L, was correct."},
+            ]
+            display_dataframe(pd.DataFrame(rows), height=260)
+            st.info("For full candle-by-candle no-lookahead replay, open Chart Workstation > AI Chart Reading & Replay. This module now auto-selects candidates for replay practice.")
+            return
+
+        if module_key == 37:
+            selected_symbol = st.selectbox("Research report candidate", table["Stock"].tolist() if not table.empty and "Stock" in table.columns else symbols, key="auto_report_candidate")
+            report = build_professional_chart_report(selected_symbol, capital=capital, risk_pct=risk_pct)
+            if not report:
+                st.info("Report could not be generated.")
+                return
+            summary = report.get("summary", {})
+            report_text = "\n\n".join([f"{title}\n{body}" for title, body in summary.items()])
+            st.text_area("Institutional Research Report Draft", report_text, height=520)
+            st.download_button("Download research report draft", report_text.encode("utf-8"), file_name=f"{selected_symbol}_institutional_research_report.txt", mime="text/plain", width="stretch")
+            return
+
+    with st.spinner(f"Analyzing {len(symbols)} auto-fetched stocks for {title}..."):
+        contexts = build_advanced_contexts(symbols, capital=capital, risk_pct=risk_pct)
 
     if module_key == 23:
-        st.caption("Order book, hidden liquidity, iceberg, spoofing, and delta volume require live Level-2/order-flow feeds. This page gives an OHLCV proxy and flags uncertainty.")
-        display_dataframe(advanced_order_flow_table(context), height=360)
+        st.caption("Auto-ranked order-flow proxy. True bid/ask depth, hidden liquidity, iceberg, spoofing, and delta volume require live Level-2 feeds.")
+        display_dataframe(module23_order_flow_universe(contexts), height=640)
         return
 
     if module_key == 24:
-        st.caption("Quarterly institution holdings require a shareholding feed. Current page combines available ownership proxies, delivery, and smart-money scores.")
-        display_dataframe(advanced_institutional_tracker_table(context), height=420)
+        st.caption("Auto-ranked institutional tracker. Quarterly holdings require a shareholding feed; current results combine ownership proxies, delivery, and smart-money scores.")
+        display_dataframe(module24_institutional_universe(contexts), height=640)
         return
 
     if module_key == 29:
-        display_dataframe(market_dna_table(context), height=420)
+        display_dataframe(module29_market_dna_universe(contexts), height=640)
         return
 
     if module_key == 30:
-        chart = context.get("chart", {})
-        rows = [
-            {"Coach Question": "Why?", "Answer": chart.get("reason", "The setup needs more evidence before action.")},
-            {"Coach Question": "What is happening?", "Answer": f"Chart stage: {chart.get('chart_stage', 'Unavailable')}; pattern: {chart.get('pattern_detected', 'Unavailable')}."},
-            {"Coach Question": "What confirms?", "Answer": "Breakout/retest acceptance, VWAP hold, RVOL expansion, strong close, and market regime support."},
-            {"Coach Question": "What invalidates?", "Answer": f"Failure below stop/retest zone. Current stop: {chart.get('stop_loss', 'Unavailable')}."},
-            {"Coach Question": "How professionals think?", "Answer": "They define risk first, wait for confirmation, and avoid forcing trades when evidence is incomplete."},
-        ]
-        display_dataframe(pd.DataFrame(rows), height=420)
+        display_dataframe(module30_trade_coach_universe(contexts), height=660)
         return
 
     if module_key == 31:
-        rows = [
-            {"Lesson": "Pattern", "Current Example": context.get("chart", {}).get("pattern_detected", "Unavailable"), "Teaching Point": "A pattern is only useful when risk, volume, and trend confirm."},
-            {"Lesson": "Pocket Pivot", "Current Example": context.get("early", {}).get("pocket_pivot_status", "Unavailable"), "Teaching Point": "Volume must exceed prior down-volume near a constructive price location."},
-            {"Lesson": "Replay", "Current Example": "Use Chart Reading & Replay page", "Teaching Point": "Replay trains decision quality without hindsight."},
-            {"Lesson": "Quiz", "Current Example": "Before entry, name confirmation and invalidation", "Teaching Point": "If you cannot state invalidation, you do not have a complete plan."},
-        ]
+        rows = []
+        for context in contexts:
+            rows.append(
+                {
+                    **context_common_fields(context),
+                    "Lesson": context.get("chart", {}).get("pattern_detected", "Unavailable"),
+                    "Teaching Point": "A pattern is only useful when risk, volume, and trend confirm.",
+                    "Quiz": "What confirms this setup, and what invalidates it?",
+                    "Replay Task": "Replay the symbol before taking the next live setup.",
+                }
+            )
         display_dataframe(pd.DataFrame(rows), height=340)
         return
 
     if module_key == 35:
-        iq = context.get("iq", {})
-        base_prob = coerce_float(iq.get("trade_probability"), coerce_float(context.get("chart", {}).get("chart_quality_score"), 50)) or 50
-        bull = bounded_score(base_prob * 0.70 + 20, 100)
-        side = bounded_score(35 - abs(base_prob - 60) * 0.25, 100)
-        bear = max(0, 100 - bull - side)
-        rows = [
-            {"Scenario": "Bull Case", "Probability %": bull, "Expected Path": f"Breakout/retest works; target zone near {iq.get('target_1', context.get('chart', {}).get('target_1', 'Unavailable'))}", "Invalidation": "Fails to hold breakout/retest zone."},
-            {"Scenario": "Sideways Case", "Probability %": side, "Expected Path": "Price remains inside range while volatility compresses.", "Invalidation": "Large volume breakdown or breakout."},
-            {"Scenario": "Bear Case", "Probability %": bear, "Expected Path": f"False breakout or trend failure toward stop {iq.get('stop_loss', context.get('chart', {}).get('stop_loss', 'Unavailable'))}", "Invalidation": "Strong close above resistance with volume."},
-        ]
-        display_dataframe(pd.DataFrame(rows), height=300)
-        return
-
-    if module_key == 37:
-        report = build_professional_chart_report(symbol, capital=capital, risk_pct=risk_pct)
-        if not report:
-            st.info("Report could not be generated.")
-            return
-        summary = report.get("summary", {})
-        report_text = "\n\n".join([f"{title}\n{body}" for title, body in summary.items()])
-        st.text_area("Institutional Research Report Draft", report_text, height=520)
-        st.download_button("Download research report draft", report_text.encode("utf-8"), file_name=f"{symbol}_institutional_research_report.txt", mime="text/plain", width="stretch")
+        display_dataframe(module35_scenario_universe(contexts), height=640)
         return
 
     if module_key == 40:
         st.markdown("**Master Brain Consensus**")
-        scorecard = advanced_scorecard_rows(context)
-        display_dataframe(scorecard, height=360)
-        order_flow = advanced_order_flow_table(context)
-        dna = market_dna_table(context)
-        st.markdown("**Order Flow + Market DNA Evidence**")
-        left, right = st.columns(2)
-        with left:
-            display_dataframe(order_flow, height=320)
-        with right:
-            display_dataframe(dna, height=320)
-        final_score = bounded_score(
-            (coerce_float(context.get("iq", {}).get("ai_iq_score"), 0) or 0) / 10 * 0.35
-            + (coerce_float(context.get("chart", {}).get("chart_quality_score"), 0) or 0) * 0.20
-            + (coerce_float(context.get("early", {}).get("ai_early_breakout_score"), 0) or 0) * 0.20
-            + (coerce_float(context.get("overnight", {}).get("tomorrow_intraday_probability"), 0) or 0) * 0.15
-            + (coerce_float(context.get("market", {}).get("market_regime_score"), 60) or 60) * 0.10,
-            100,
-        )
-        st.metric("Master Brain Consensus Score", final_score)
+        table = module40_master_brain_universe(contexts)
+        display_dataframe(table, height=660)
+        if not table.empty:
+            st.metric("Top Master Brain Score", table.iloc[0].get("Master Brain Score", "Unavailable"))
         st.info("Final decision remains evidence-based: no trade is better than forcing a low-quality setup.")
         return
 
-    st.markdown("**Base Advanced Scorecard**")
-    display_dataframe(advanced_scorecard_rows(context), height=360)
+    table = module40_master_brain_universe(contexts)
+    display_dataframe(table, height=620)
 
 
 def initialize_chart_replay_state() -> None:
