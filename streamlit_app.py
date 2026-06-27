@@ -1016,6 +1016,7 @@ def sidebar_page_choice() -> str:
                 "AI Overnight Opportunity",
                 "AI Chart Reading Engine",
                 "AI Professional Chart Interpretation",
+                "AI Chart Reading & Replay",
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
@@ -5405,9 +5406,9 @@ def classify_chart_stage(current: float, ema50: float, ema200: float, ema200_pri
     return "Stage 1 - Accumulation"
 
 
-def score_ai_chart_reading_candidate(row: pd.Series) -> dict[str, Any]:
+def score_ai_chart_reading_candidate(row: pd.Series, history_override: pd.DataFrame | None = None) -> dict[str, Any]:
     symbol = str(row.get("nsecode") or "").strip().upper()
-    history = fetch_ohlcv_history(symbol, lookback_days=900)
+    history = history_override.copy() if isinstance(history_override, pd.DataFrame) and not history_override.empty else fetch_ohlcv_history(symbol, lookback_days=900)
     required = {"open", "high", "low", "close", "volume"}
     if history.empty or len(history) < 220 or not required.issubset(history.columns):
         return {"chart_quality_score": 0, "nsecode": symbol, "reason": "Historical OHLCV unavailable or insufficient."}
@@ -5926,35 +5927,45 @@ def timeframe_interpretation(history: pd.DataFrame, label: str) -> dict[str, Any
     }
 
 
-def build_professional_chart_report(symbol: str, capital: float, risk_pct: float) -> dict[str, Any]:
+def build_professional_chart_report(
+    symbol: str,
+    capital: float,
+    risk_pct: float,
+    daily_history_override: pd.DataFrame | None = None,
+    replay_mode: bool = False,
+) -> dict[str, Any]:
     cleaned_symbol = symbol.strip().upper().replace(".NS", "")
     if not cleaned_symbol:
         return {}
 
     row = pd.Series({"nsecode": cleaned_symbol, "name": cleaned_symbol})
-    daily_history = fetch_ohlcv_history(cleaned_symbol, lookback_days=900)
+    daily_history = daily_history_override.copy() if isinstance(daily_history_override, pd.DataFrame) and not daily_history_override.empty else fetch_ohlcv_history(cleaned_symbol, lookback_days=900)
     weekly_history = resample_chart_timeframe(daily_history, "W-FRI")
     monthly_history = resample_chart_timeframe(daily_history, "M")
-    one_hour = fetch_interval_ohlcv_history(cleaned_symbol, period="60d", interval="60m")
-    fifteen_min = fetch_interval_ohlcv_history(cleaned_symbol, period="30d", interval="15m")
-    five_min = fetch_interval_ohlcv_history(cleaned_symbol, period="5d", interval="5m")
+    one_hour = pd.DataFrame() if replay_mode else fetch_interval_ohlcv_history(cleaned_symbol, period="60d", interval="60m")
+    fifteen_min = pd.DataFrame() if replay_mode else fetch_interval_ohlcv_history(cleaned_symbol, period="30d", interval="15m")
+    five_min = pd.DataFrame() if replay_mode else fetch_interval_ohlcv_history(cleaned_symbol, period="5d", interval="5m")
 
-    chart = score_ai_chart_reading_candidate(row)
+    chart = score_ai_chart_reading_candidate(row, history_override=daily_history)
     if not isinstance(chart, dict):
         chart = {"chart_quality_score": 0, "reason": "Chart data unavailable."}
 
-    try:
-        early = score_ai_early_breakout_candidate(row)
-    except Exception:
+    if replay_mode:
         early = {}
-    if not isinstance(early, dict):
-        early = {}
-
-    market_regime = compute_iq5000_market_regime()
-    try:
-        iq = score_iq5000_candidate(row, market_regime=market_regime, capital=capital, max_risk_pct=risk_pct, max_capital_pct=25.0)
-    except Exception:
         iq = {}
+    else:
+        try:
+            early = score_ai_early_breakout_candidate(row)
+        except Exception:
+            early = {}
+        if not isinstance(early, dict):
+            early = {}
+
+        market_regime = compute_iq5000_market_regime()
+        try:
+            iq = score_iq5000_candidate(row, market_regime=market_regime, capital=capital, max_risk_pct=risk_pct, max_capital_pct=25.0)
+        except Exception:
+            iq = {}
     if not isinstance(iq, dict):
         iq = {}
 
@@ -6204,6 +6215,300 @@ def render_professional_chart_interpretation_page() -> None:
         display_dataframe(report["scores"], height=520)
 
 
+def initialize_chart_replay_state() -> None:
+    if "chart_replay_memory" not in st.session_state:
+        st.session_state["chart_replay_memory"] = pd.DataFrame(
+            columns=[
+                "Date",
+                "Symbol",
+                "Replay Date",
+                "Chart Quality Score",
+                "Verdict",
+                "Prediction Accuracy",
+                "MFE %",
+                "MAE %",
+                "Time To Target",
+                "Time To Stop",
+                "Plan Valid",
+            ]
+        )
+
+
+def prepare_replay_history(full_history: pd.DataFrame, replay_date: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp | None]:
+    if full_history.empty or "date" not in full_history.columns:
+        return pd.DataFrame(), pd.DataFrame(), None
+    working = full_history.copy()
+    working["date"] = pd.to_datetime(working["date"], errors="coerce")
+    working = working.dropna(subset=["date"]).sort_values("date")
+    replay_ts = pd.Timestamp(replay_date)
+    past = working[working["date"] <= replay_ts].copy()
+    if past.empty:
+        return pd.DataFrame(), working, None
+    selected_ts = pd.Timestamp(past["date"].iloc[-1])
+    future = working[working["date"] > selected_ts].copy()
+    return past, future, selected_ts
+
+
+def evaluate_chart_replay_outcome(future: pd.DataFrame, chart: dict[str, Any]) -> dict[str, Any]:
+    if future.empty:
+        return {
+            "outcomes": pd.DataFrame(),
+            "summary": pd.DataFrame([{"Metric": "Outcome", "Value": "No future candles available after replay date."}]),
+        }
+
+    working = future.copy().head(20)
+    for column in ["open", "high", "low", "close", "volume"]:
+        if column in working.columns:
+            working[column] = pd.to_numeric(working[column], errors="coerce")
+    working = working.dropna(subset=["close", "high", "low"])
+    if working.empty:
+        return {
+            "outcomes": pd.DataFrame(),
+            "summary": pd.DataFrame([{"Metric": "Outcome", "Value": "Future candles are incomplete."}]),
+        }
+
+    entry = coerce_float(chart.get("entry_price"), None) or float(working["open"].iloc[0])
+    stop = coerce_float(chart.get("stop_loss"), None) or entry * 0.94
+    target = coerce_float(chart.get("target_1"), None) or entry * 1.12
+    replay_close = entry
+
+    outcomes = []
+    for horizon in [1, 3, 5, 10, 20]:
+        horizon_df = working.head(horizon)
+        if horizon_df.empty:
+            continue
+        last_close = float(horizon_df["close"].iloc[-1])
+        max_high = float(horizon_df["high"].max())
+        min_low = float(horizon_df["low"].min())
+        outcomes.append(
+            {
+                "Horizon": f"{horizon}D",
+                "Close": round(last_close, 2),
+                "Return %": round((last_close - replay_close) / replay_close * 100, 2) if replay_close else 0,
+                "MFE %": round((max_high - entry) / entry * 100, 2) if entry else 0,
+                "MAE %": round((min_low - entry) / entry * 100, 2) if entry else 0,
+                "Target Hit": bool(max_high >= target),
+                "Stop Hit": bool(min_low <= stop),
+            }
+        )
+
+    target_hit_day = None
+    stop_hit_day = None
+    best_exit_day = None
+    best_exit_return = None
+    worst_drawdown = None
+    for day_index, (_, candle) in enumerate(working.iterrows(), start=1):
+        if target_hit_day is None and float(candle["high"]) >= target:
+            target_hit_day = day_index
+        if stop_hit_day is None and float(candle["low"]) <= stop:
+            stop_hit_day = day_index
+        day_return = (float(candle["close"]) - entry) / entry * 100 if entry else 0
+        if best_exit_return is None or day_return > best_exit_return:
+            best_exit_return = day_return
+            best_exit_day = day_index
+    worst_drawdown = (float(working["low"].min()) - entry) / entry * 100 if entry else 0
+    mfe = (float(working["high"].max()) - entry) / entry * 100 if entry else 0
+    mae = (float(working["low"].min()) - entry) / entry * 100 if entry else 0
+    chart_score = coerce_float(chart.get("chart_quality_score"), 0) or 0
+    bullish_prediction = chart_score >= 80
+    final_return = (float(working["close"].iloc[-1]) - entry) / entry * 100 if entry else 0
+    target_before_stop = target_hit_day is not None and (stop_hit_day is None or target_hit_day <= stop_hit_day)
+    if bullish_prediction:
+        prediction_accuracy = 100 if target_before_stop else 70 if final_return > 0 and mae > -8 else 35
+    else:
+        prediction_accuracy = 80 if final_return <= 0 or stop_hit_day is not None else 45
+    plan_valid = "Yes" if target_before_stop or (bullish_prediction and final_return > 0 and mae > -8) else "No"
+
+    summary = pd.DataFrame(
+        [
+            {"Metric": "Prediction Accuracy", "Value": f"{prediction_accuracy:.0f}%"},
+            {"Metric": "Maximum Favorable Excursion", "Value": f"{mfe:.2f}%"},
+            {"Metric": "Maximum Adverse Excursion", "Value": f"{mae:.2f}%"},
+            {"Metric": "Time To Target", "Value": f"{target_hit_day} trading days" if target_hit_day else "Not hit in 20 sessions"},
+            {"Metric": "Time To Stop Loss", "Value": f"{stop_hit_day} trading days" if stop_hit_day else "Not hit in 20 sessions"},
+            {"Metric": "Best Exit Point", "Value": f"Day {best_exit_day}, {best_exit_return:.2f}%" if best_exit_day else "Unavailable"},
+            {"Metric": "Worst Drawdown", "Value": f"{worst_drawdown:.2f}%"},
+            {"Metric": "Trade Plan Valid", "Value": plan_valid},
+        ]
+    )
+    return {
+        "outcomes": pd.DataFrame(outcomes),
+        "summary": summary,
+        "accuracy": prediction_accuracy,
+        "mfe": mfe,
+        "mae": mae,
+        "target_hit_day": target_hit_day,
+        "stop_hit_day": stop_hit_day,
+        "plan_valid": plan_valid,
+    }
+
+
+def render_professional_report_tabs(report: dict[str, Any], height: int = 360) -> None:
+    chart = report.get("chart", {})
+    tab_report, tab_structure, tab_volume, tab_swot, tab_plan, tab_scores = st.tabs(
+        ["Analyst Report", "Structure", "Volume & Footprints", "Chart SWOT", "Trading Plan", "Scores"]
+    )
+    with tab_report:
+        for title, body in report.get("summary", {}).items():
+            st.markdown(f"**{title}**")
+            st.write(body)
+    with tab_structure:
+        structure_rows = [
+            {"Metric": "Chart Stage", "Value": chart.get("chart_stage", "Unavailable")},
+            {"Metric": "Pattern Detected", "Value": chart.get("pattern_detected", "Unavailable")},
+            {"Metric": "Candlestick Signal", "Value": chart.get("candlestick_signal", "Unavailable")},
+            {"Metric": "Support Zone", "Value": chart.get("support_zone", "Unavailable")},
+            {"Metric": "Resistance Zone", "Value": chart.get("resistance_zone", "Unavailable")},
+            {"Metric": "Breakout Level", "Value": chart.get("breakout_level", "Unavailable")},
+            {"Metric": "Retest Zone", "Value": chart.get("retest_zone", "Unavailable")},
+            {"Metric": "Reason", "Value": chart.get("reason", "Unavailable")},
+        ]
+        display_dataframe(pd.DataFrame(structure_rows), height=height)
+        st.markdown("**Multi-Timeframe Analysis**")
+        display_dataframe(report.get("timeframes", pd.DataFrame()), height=300)
+    with tab_volume:
+        volume_rows = [
+            {"Metric": "Volume Confirmation", "Value": chart.get("volume_confirmation", "Unavailable")},
+            {"Metric": "Institutional Footprints", "Value": chart.get("institutional_footprints", "Unavailable")},
+            {"Metric": "Relative Volume", "Value": chart.get("rvol", "Unavailable")},
+            {"Metric": "RSI Context", "Value": chart.get("rsi", "Unavailable")},
+            {"Metric": "Smart Money Interpretation", "Value": report.get("summary", {}).get("Institutional Activity", "Unavailable")},
+        ]
+        display_dataframe(pd.DataFrame(volume_rows), height=260)
+        st.info(report.get("summary", {}).get("Legendary Analyst Explanation", "Volume and price must confirm each other before action."))
+    with tab_swot:
+        display_dataframe(report.get("swot", pd.DataFrame()), height=260)
+    with tab_plan:
+        display_dataframe(report.get("plan", pd.DataFrame()), height=420)
+        st.caption("This is a research plan. Actual entry requires live confirmation, liquidity, and disciplined risk control.")
+    with tab_scores:
+        display_dataframe(report.get("scores", pd.DataFrame()), height=520)
+
+
+def render_chart_reading_replay_page() -> None:
+    initialize_chart_replay_state()
+    st.subheader("AI Chart Reading & Replay Engine")
+    st.caption("Module 20 + 21: professional chart interpretation plus no-lookahead historical replay and prediction validation.")
+
+    with st.sidebar:
+        st.header("Chart Replay Controls")
+        symbol = st.text_input("Stock symbol or company name", value="RELIANCE", key="chart_replay_symbol")
+        capital = st.number_input("Trading capital", min_value=10_000.0, value=500_000.0, step=50_000.0, key="chart_replay_capital")
+        risk_pct = st.slider("Max risk per idea %", 0.25, 5.0, 1.0, 0.25, key="chart_replay_risk")
+        if st.button("Refresh chart replay engine", type="primary", width="stretch"):
+            fetch_ohlcv_history.clear()
+            fetch_interval_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            st.rerun()
+
+    cleaned_symbol = symbol.strip().upper().replace(".NS", "")
+    if not cleaned_symbol:
+        st.info("Enter an NSE symbol such as RELIANCE, SBIN, BEL, CDSL, or TRENT.")
+        return
+
+    live_tab, replay_tab, memory_tab = st.tabs(["Professional Reading", "Chart Replay", "Replay Memory"])
+
+    with live_tab:
+        with st.spinner(f"Reading {cleaned_symbol} with current chart data..."):
+            live_report = build_professional_chart_report(cleaned_symbol, capital=capital, risk_pct=risk_pct)
+        if not live_report:
+            st.info("No live chart report could be generated.")
+        else:
+            chart = live_report.get("chart", {})
+            col_a, col_b, col_c, col_d = st.columns(4)
+            col_a.metric("Final Verdict", live_report.get("verdict", "Unavailable"))
+            col_b.metric("Chart Quality", int(coerce_float(chart.get("chart_quality_score"), 0) or 0))
+            col_c.metric("Risk/Reward", chart.get("risk_reward", "Unavailable"))
+            col_d.metric("False Breakout Risk", chart.get("false_breakout_risk", "Unavailable"))
+            render_professional_report_tabs(live_report)
+
+    with replay_tab:
+        full_history = fetch_ohlcv_history(cleaned_symbol, lookback_days=1200)
+        if full_history.empty or "date" not in full_history.columns:
+            st.info("Historical data unavailable for replay.")
+        else:
+            history_dates = pd.to_datetime(full_history["date"], errors="coerce").dropna().sort_values()
+            if history_dates.empty:
+                st.info("Historical dates unavailable for replay.")
+            else:
+                min_date = history_dates.iloc[min(220, len(history_dates) - 1)].date()
+                max_date = history_dates.iloc[max(0, len(history_dates) - 21)].date()
+                default_date = history_dates.iloc[max(0, len(history_dates) - 60)].date()
+                replay_date = st.date_input(
+                    "Replay date",
+                    value=default_date,
+                    min_value=min_date,
+                    max_value=max_date,
+                    key="chart_replay_date",
+                )
+                past, future, selected_ts = prepare_replay_history(full_history, replay_date)
+                if past.empty or selected_ts is None or len(past) < 220:
+                    st.warning("Select a later replay date with at least 220 prior trading sessions.")
+                else:
+                    st.caption(f"Replay is locked to data available up to {selected_ts.date()}. Candles after this date are hidden from the interpretation.")
+                    with st.spinner("Running no-lookahead chart interpretation..."):
+                        replay_report = build_professional_chart_report(
+                            cleaned_symbol,
+                            capital=capital,
+                            risk_pct=risk_pct,
+                            daily_history_override=past,
+                            replay_mode=True,
+                        )
+                    if not replay_report:
+                        st.info("No replay report could be generated.")
+                    else:
+                        replay_chart = replay_report.get("chart", {})
+                        outcome = evaluate_chart_replay_outcome(future, replay_chart)
+                        col_a, col_b, col_c, col_d = st.columns(4)
+                        col_a.metric("Replay Verdict", replay_report.get("verdict", "Unavailable"))
+                        col_b.metric("Replay Chart Score", int(coerce_float(replay_chart.get("chart_quality_score"), 0) or 0))
+                        col_c.metric("Prediction Accuracy", f"{coerce_float(outcome.get('accuracy'), 0):.0f}%")
+                        col_d.metric("Plan Valid", outcome.get("plan_valid", "Unavailable"))
+
+                        st.subheader("No-Lookahead Interpretation")
+                        render_professional_report_tabs(replay_report, height=320)
+
+                        st.subheader("What Actually Happened Next")
+                        if isinstance(outcome.get("outcomes"), pd.DataFrame) and not outcome["outcomes"].empty:
+                            display_dataframe(outcome["outcomes"], height=260)
+                        display_dataframe(outcome.get("summary", pd.DataFrame()), height=300)
+
+                        replay_row = {
+                            "Date": date.today().isoformat(),
+                            "Symbol": cleaned_symbol,
+                            "Replay Date": str(selected_ts.date()),
+                            "Chart Quality Score": replay_chart.get("chart_quality_score"),
+                            "Verdict": replay_report.get("verdict"),
+                            "Prediction Accuracy": outcome.get("accuracy"),
+                            "MFE %": round(coerce_float(outcome.get("mfe"), 0) or 0, 2),
+                            "MAE %": round(coerce_float(outcome.get("mae"), 0) or 0, 2),
+                            "Time To Target": outcome.get("target_hit_day") or "Not hit",
+                            "Time To Stop": outcome.get("stop_hit_day") or "Not hit",
+                            "Plan Valid": outcome.get("plan_valid"),
+                        }
+                        if st.button("Store replay result in self-learning memory", width="stretch"):
+                            st.session_state["chart_replay_memory"] = pd.concat(
+                                [st.session_state["chart_replay_memory"], pd.DataFrame([replay_row])],
+                                ignore_index=True,
+                            )
+                            st.success("Replay result stored in session memory.")
+
+    with memory_tab:
+        st.subheader("Chart Replay Self-Learning Memory")
+        memory_df = st.session_state.get("chart_replay_memory", pd.DataFrame())
+        if memory_df.empty:
+            st.info("No replay results stored yet.")
+        else:
+            display_dataframe(memory_df, height=420)
+            st.download_button(
+                "Download chart replay memory CSV",
+                memory_df.to_csv(index=False).encode("utf-8"),
+                file_name="chart_replay_memory.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
+
 def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("High Accuracy Candidates")
@@ -6253,6 +6558,9 @@ def main() -> None:
         return
     if selected_page == "AI Professional Chart Interpretation":
         render_professional_chart_interpretation_page()
+        return
+    if selected_page == "AI Chart Reading & Replay":
+        render_chart_reading_replay_page()
         return
     if selected_page == "AI Early Breakout Score":
         render_ai_early_breakout_page()
