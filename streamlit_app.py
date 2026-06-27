@@ -1015,6 +1015,7 @@ def sidebar_page_choice() -> str:
                 "IQ-5000 AI Trading Platform",
                 "AI Overnight Opportunity",
                 "AI Chart Reading Engine",
+                "AI Professional Chart Interpretation",
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
@@ -1560,6 +1561,26 @@ def fetch_ohlcv_history(nsecode: str, lookback_days: int = 365) -> pd.DataFrame:
     start = date.today() - timedelta(days=lookback_days)
     try:
         history = yf.download(symbol, start=start.isoformat(), progress=False, auto_adjust=False, threads=False)
+    except Exception:
+        return pd.DataFrame()
+
+    if history.empty:
+        return pd.DataFrame()
+
+    return normalize_ohlcv_columns(history)
+
+
+@st.cache_data(ttl=60 * 15, show_spinner=False)
+def fetch_interval_ohlcv_history(nsecode: str, period: str = "60d", interval: str = "60m") -> pd.DataFrame:
+    if yf is None or not nsecode:
+        return pd.DataFrame()
+
+    symbol = str(nsecode).strip().upper()
+    if not symbol.startswith("^") and not symbol.endswith(".NS"):
+        symbol = f"{symbol}.NS"
+
+    try:
+        history = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False, threads=False)
     except Exception:
         return pd.DataFrame()
 
@@ -5832,6 +5853,344 @@ def render_ai_chart_reading_page() -> None:
         display_dataframe(model[ai_chart_reading_display_columns(model)].head(rows_shown), height=620)
 
 
+def timeframe_interpretation(history: pd.DataFrame, label: str) -> dict[str, Any]:
+    if history.empty or "close" not in history.columns:
+        return {
+            "Timeframe": label,
+            "Bias": "Unavailable",
+            "Trend Evidence": "Data unavailable",
+            "Conflict": "Cannot confirm",
+        }
+
+    working = history.copy()
+    for column in ["close", "high", "low", "volume"]:
+        if column in working.columns:
+            working[column] = pd.to_numeric(working[column], errors="coerce")
+    working = working.dropna(subset=["close"])
+    if len(working) < 20:
+        return {
+            "Timeframe": label,
+            "Bias": "Unavailable",
+            "Trend Evidence": "Insufficient rows",
+            "Conflict": "Cannot confirm",
+        }
+
+    close = working["close"]
+    high = working["high"] if "high" in working.columns else close
+    low = working["low"] if "low" in working.columns else close
+    volume = working["volume"] if "volume" in working.columns else pd.Series(0, index=working.index)
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean() if len(close) >= 50 else ema20
+    latest = float(close.iloc[-1])
+    ret = (close.iloc[-1] / close.iloc[max(0, len(close) - 11)] - 1) * 100 if close.iloc[max(0, len(close) - 11)] else 0
+    higher_lows = bool(low.tail(8).min() >= low.shift(8).tail(8).min()) if len(low) >= 16 else False
+    higher_highs = bool(high.tail(8).max() >= high.shift(8).tail(8).max()) if len(high) >= 16 else False
+    rvol = float(volume.iloc[-1] / volume.tail(20).mean()) if "volume" in working.columns and volume.tail(20).mean() else 0
+
+    if latest > ema20.iloc[-1] and ema20.iloc[-1] >= ema50.iloc[-1] and ret > 0:
+        bias = "Bullish"
+    elif latest < ema20.iloc[-1] and ret < 0:
+        bias = "Bearish"
+    else:
+        bias = "Neutral"
+
+    evidence = []
+    evidence.append("price above EMA20" if latest > ema20.iloc[-1] else "price below EMA20")
+    evidence.append("EMA20 above EMA50" if ema20.iloc[-1] >= ema50.iloc[-1] else "EMA20 below EMA50")
+    if higher_highs:
+        evidence.append("higher highs")
+    if higher_lows:
+        evidence.append("higher lows")
+    if rvol >= 1.2:
+        evidence.append(f"volume {rvol:.2f}x average")
+
+    return {
+        "Timeframe": label,
+        "Bias": bias,
+        "Trend Evidence": ", ".join(evidence),
+        "Recent Return %": round(float(ret), 2),
+        "Conflict": "Aligned" if bias == "Bullish" else "Needs confirmation" if bias == "Neutral" else "Conflicting/weak",
+    }
+
+
+def build_professional_chart_report(symbol: str, capital: float, risk_pct: float) -> dict[str, Any]:
+    cleaned_symbol = symbol.strip().upper().replace(".NS", "")
+    if not cleaned_symbol:
+        return {}
+
+    row = pd.Series({"nsecode": cleaned_symbol, "name": cleaned_symbol})
+    daily_history = fetch_ohlcv_history(cleaned_symbol, lookback_days=900)
+    weekly_history = resample_chart_timeframe(daily_history, "W-FRI")
+    monthly_history = resample_chart_timeframe(daily_history, "M")
+    one_hour = fetch_interval_ohlcv_history(cleaned_symbol, period="60d", interval="60m")
+    fifteen_min = fetch_interval_ohlcv_history(cleaned_symbol, period="30d", interval="15m")
+    five_min = fetch_interval_ohlcv_history(cleaned_symbol, period="5d", interval="5m")
+
+    chart = score_ai_chart_reading_candidate(row)
+    if not isinstance(chart, dict):
+        chart = {"chart_quality_score": 0, "reason": "Chart data unavailable."}
+
+    try:
+        early = score_ai_early_breakout_candidate(row)
+    except Exception:
+        early = {}
+    if not isinstance(early, dict):
+        early = {}
+
+    market_regime = compute_iq5000_market_regime()
+    try:
+        iq = score_iq5000_candidate(row, market_regime=market_regime, capital=capital, max_risk_pct=risk_pct, max_capital_pct=25.0)
+    except Exception:
+        iq = {}
+    if not isinstance(iq, dict):
+        iq = {}
+
+    timeframes = pd.DataFrame(
+        [
+            timeframe_interpretation(monthly_history.reset_index() if not monthly_history.empty else pd.DataFrame(), "Monthly"),
+            timeframe_interpretation(weekly_history.reset_index() if not weekly_history.empty else pd.DataFrame(), "Weekly"),
+            timeframe_interpretation(daily_history, "Daily"),
+            timeframe_interpretation(one_hour, "1 Hour"),
+            timeframe_interpretation(fifteen_min, "15 Minute"),
+            timeframe_interpretation(five_min, "5 Minute"),
+        ]
+    )
+
+    chart_score = coerce_float(chart.get("chart_quality_score"), 0) or 0
+    early_score = coerce_float(early.get("ai_early_breakout_score"), 0) or 0
+    institutional_score = coerce_float(iq.get("ai_institutional_score"), 0) or coerce_float(chart.get("institutional_footprints_score"), 0) * 10 or 0
+    smart_money_score = coerce_float(iq.get("smart_money_score"), 0) or institutional_score
+    intraday_score = coerce_float(iq.get("ai_intraday_score"), 0) or max(0, chart_score - 10)
+    swing_score = coerce_float(iq.get("ai_swing_score"), 0) or chart_score
+    iq_score = coerce_float(iq.get("ai_iq_score"), 0) or chart_score * 10
+    consensus = bounded_score((chart_score + early_score + institutional_score + smart_money_score + swing_score) / 5, 100)
+    trade_probability = bounded_score((chart_score * 0.35) + (early_score * 0.20) + (institutional_score * 0.20) + (consensus * 0.25), 100)
+
+    scores = pd.DataFrame(
+        [
+            {"Score": "Chart Quality Score", "Value": round(chart_score, 2)},
+            {"Score": "Trend Score", "Value": chart.get("trend_clarity_score", 0)},
+            {"Score": "Pattern Score", "Value": chart.get("pattern_reliability_score", 0)},
+            {"Score": "Volume Score", "Value": chart.get("volume_confirmation_score", 0)},
+            {"Score": "Institutional Score", "Value": round(institutional_score, 2)},
+            {"Score": "Smart Money Score", "Value": round(smart_money_score, 2)},
+            {"Score": "AI Intraday Score", "Value": round(intraday_score, 2)},
+            {"Score": "AI Swing Score", "Value": round(swing_score, 2)},
+            {"Score": "AI Institutional Score", "Value": round(institutional_score, 2)},
+            {"Score": "AI Early Breakout Score", "Value": round(early_score, 2)},
+            {"Score": "AI IQ Score", "Value": round(iq_score, 2)},
+            {"Score": "Consensus Score", "Value": consensus},
+            {"Score": "Trade Probability", "Value": trade_probability},
+        ]
+    )
+
+    bullish_timeframes = int((timeframes["Bias"] == "Bullish").sum()) if "Bias" in timeframes.columns else 0
+    bearish_timeframes = int((timeframes["Bias"] == "Bearish").sum()) if "Bias" in timeframes.columns else 0
+    if chart_score >= 92 and consensus >= 80 and trade_probability >= 80:
+        verdict = "5/5 Elite Institutional Buy"
+    elif chart_score >= 85 and consensus >= 72:
+        verdict = "4/5 Strong Buy"
+    elif chart_score >= 78:
+        verdict = "4/5 Buy on Dips"
+    elif chart_score >= 65:
+        verdict = "3/5 Watchlist"
+    elif chart_score >= 45:
+        verdict = "2/5 Avoid for Now"
+    else:
+        verdict = "1/5 Strong Avoid"
+
+    entry_price = coerce_float(chart.get("entry_price"), None)
+    stop_loss = coerce_float(chart.get("stop_loss"), None)
+    target_1 = coerce_float(chart.get("target_1"), None)
+    target_2 = coerce_float(chart.get("target_2"), None)
+    risk_amount = capital * risk_pct / 100
+    per_share_risk = max((entry_price or 0) - (stop_loss or 0), 0.01)
+    position_size = int(risk_amount / per_share_risk) if entry_price and stop_loss and entry_price > stop_loss else 0
+    target_3 = entry_price + per_share_risk * 7 if entry_price else None
+
+    strengths = []
+    weaknesses = []
+    opportunities = []
+    threats = []
+    if chart_score >= 80:
+        strengths.append("Chart quality is high enough to justify active monitoring.")
+    else:
+        weaknesses.append("Chart quality is not yet in the high-conviction zone.")
+    if bullish_timeframes >= 4:
+        strengths.append("Most monitored timeframes are aligned bullish.")
+    elif bearish_timeframes >= 2:
+        threats.append("Multiple timeframes remain bearish or conflicting.")
+    if "Darvas" in str(chart.get("pattern_detected")) or "VCP" in str(chart.get("pattern_detected")):
+        opportunities.append("Base/compression pattern may support a breakout attempt.")
+    if coerce_float(chart.get("false_breakout_risk"), 100) and coerce_float(chart.get("false_breakout_risk"), 100) > 60:
+        threats.append("False breakout risk is elevated and needs live confirmation.")
+    if str(chart.get("volume_confirmation", "")).lower() == "confirmed":
+        strengths.append("Volume is supporting the current structure.")
+    else:
+        weaknesses.append("Volume confirmation is incomplete.")
+    if str(chart.get("institutional_footprints", "")).lower() in {"strong", "present"}:
+        strengths.append("Institutional footprints are visible in the chart behavior.")
+    else:
+        weaknesses.append("Institutional footprints are not strong yet.")
+    if not opportunities:
+        opportunities.append("Wait for a clean breakout, retest, or VWAP-supported entry.")
+    if not threats:
+        threats.append("Main risk is a failed breakout if volume or market breadth weakens.")
+
+    swot = pd.DataFrame(
+        [
+            {"Type": "Strengths", "Details": "; ".join(strengths)},
+            {"Type": "Weaknesses", "Details": "; ".join(weaknesses)},
+            {"Type": "Opportunities", "Details": "; ".join(opportunities)},
+            {"Type": "Threats", "Details": "; ".join(threats)},
+        ]
+    )
+
+    plan = pd.DataFrame(
+        [
+            {"Plan Item": "Ideal Entry", "Value": chart.get("entry_trigger", "Wait for confirmation")},
+            {"Plan Item": "Aggressive Entry", "Value": f"Above {entry_price:.2f}" if entry_price else "Unavailable"},
+            {"Plan Item": "Conservative Entry", "Value": f"Retest zone {chart.get('retest_zone', 'Unavailable')}"},
+            {"Plan Item": "Breakout Entry", "Value": f"Breakout level {chart.get('breakout_level', 'Unavailable')}"},
+            {"Plan Item": "Retest Entry", "Value": chart.get("retest_zone", "Unavailable")},
+            {"Plan Item": "Stop Loss", "Value": f"{stop_loss:.2f}" if stop_loss else "Unavailable"},
+            {"Plan Item": "Target 1", "Value": f"{target_1:.2f}" if target_1 else "Unavailable"},
+            {"Plan Item": "Target 2", "Value": f"{target_2:.2f}" if target_2 else "Unavailable"},
+            {"Plan Item": "Target 3", "Value": f"{target_3:.2f}" if target_3 else "Unavailable"},
+            {"Plan Item": "Trailing Stop", "Value": "Trail below EMA20 or 2 ATR after target 1."},
+            {"Plan Item": "Expected Holding Period", "Value": "Intraday to swing; use live structure for final timing."},
+            {"Plan Item": "Position Size", "Value": position_size},
+            {"Plan Item": "Rupee Risk", "Value": round(risk_amount, 2)},
+        ]
+    )
+
+    buyers_comment = "Buyers are in control when price holds above key moving averages and closes near the upper part of the range."
+    if chart_score >= 80:
+        buyers_comment = "Buyers appear to be defending higher levels, with structure and volume supporting continued monitoring."
+    sellers_comment = "Sellers are not fully defeated until price accepts above resistance and holds the retest zone."
+    if coerce_float(chart.get("false_breakout_risk"), 100) and coerce_float(chart.get("false_breakout_risk"), 100) >= 60:
+        sellers_comment = "Sellers still have influence because false-breakout risk is elevated near resistance."
+
+    professional_summary = {
+        "Executive Summary": f"{cleaned_symbol} is classified as {chart.get('chart_stage', 'Unavailable')} with a chart quality score of {chart_score:.0f}/100 and final verdict: {verdict}.",
+        "Current Market Structure": f"The chart is showing {chart.get('pattern_detected', 'no major pattern confirmed')}. Support is around {chart.get('support_zone', 'Unavailable')} and resistance is around {chart.get('resistance_zone', 'Unavailable')}.",
+        "Trend Analysis": f"{bullish_timeframes} of 6 monitored timeframes are bullish. Higher-timeframe conflicts should be respected before capital deployment.",
+        "Volume Analysis": f"Volume confirmation is {chart.get('volume_confirmation', 'Unavailable')} with RVOL near {chart.get('rvol', 'Unavailable')}.",
+        "Institutional Activity": f"Institutional footprint reading: {chart.get('institutional_footprints', 'Unavailable')}. Smart money score estimate: {smart_money_score:.0f}/100.",
+        "Strengths": "; ".join(strengths),
+        "Weaknesses": "; ".join(weaknesses),
+        "Risks": f"False breakout risk is {chart.get('false_breakout_risk', 'Unavailable')}/100. Gap, trend failure, and liquidity risks must be controlled with position sizing.",
+        "Trading Strategy": f"Use {chart.get('entry_trigger', 'confirmation-based entry')} with stop near {stop_loss:.2f}" if stop_loss else "Wait for a valid entry and stop before trading.",
+        "Swing Outlook": "Constructive" if swing_score >= 75 else "Neutral/unclear",
+        "Intraday Outlook": "Constructive after VWAP/ORB confirmation" if intraday_score >= 70 else "Needs live confirmation",
+        "Long-Term Outlook": "Constructive if monthly and weekly remain bullish" if bullish_timeframes >= 3 else "Mixed until higher timeframes improve",
+        "Capital Allocation Recommendation": "Deploy only after confirmation; use reduced size if verdict is below Strong Buy.",
+        "Expected Probability": f"{trade_probability}/100",
+        "Confidence Level": f"{consensus}/100 consensus",
+        "Historical Similarity": iq.get("historical_win_rate", "Unavailable"),
+        "Market Memory Reference": iq.get("market_memory_score", "Unavailable"),
+        "Legendary Analyst Explanation": f"{buyers_comment} {sellers_comment} Momentum should be interpreted through price acceptance, not indicators alone.",
+    }
+
+    return {
+        "symbol": cleaned_symbol,
+        "chart": chart,
+        "early": early,
+        "iq": iq,
+        "timeframes": timeframes,
+        "scores": scores,
+        "swot": swot,
+        "plan": plan,
+        "summary": professional_summary,
+        "verdict": verdict,
+    }
+
+
+def render_professional_chart_interpretation_page() -> None:
+    st.subheader("AI Professional Chart Interpretation Engine")
+    st.caption("Enter any NSE symbol to generate an institutional-grade chart interpretation, trading plan, SWOT, scores, and professional analyst summary.")
+
+    with st.sidebar:
+        st.header("Professional Chart Controls")
+        symbol = st.text_input("Stock symbol or company name", value="RELIANCE", key="professional_chart_symbol")
+        capital = st.number_input("Trading capital", min_value=10_000.0, value=500_000.0, step=50_000.0, key="professional_chart_capital")
+        risk_pct = st.slider("Max risk per idea %", 0.25, 5.0, 1.0, 0.25, key="professional_chart_risk")
+        if st.button("Refresh professional interpretation", type="primary", width="stretch"):
+            fetch_ohlcv_history.clear()
+            fetch_interval_ohlcv_history.clear()
+            fetch_nse_delivery_snapshot.clear()
+            st.rerun()
+
+    cleaned_symbol = symbol.strip().upper().replace(".NS", "")
+    if not cleaned_symbol:
+        st.info("Enter an NSE symbol such as RELIANCE, SBIN, BEL, CDSL, or TRENT.")
+        return
+    if " " in cleaned_symbol:
+        st.warning("For reliable data lookup, use the NSE trading symbol. Company-name lookup is limited by the current data provider.")
+
+    with st.spinner(f"Reading {cleaned_symbol} like a professional chart analyst..."):
+        report = build_professional_chart_report(cleaned_symbol, capital=capital, risk_pct=risk_pct)
+
+    if not report:
+        st.info("No report could be generated for this symbol.")
+        return
+
+    chart = report.get("chart", {})
+    metric_a, metric_b, metric_c, metric_d = st.columns(4)
+    metric_a.metric("Final Verdict", report.get("verdict", "Unavailable"))
+    metric_b.metric("Chart Quality", int(coerce_float(chart.get("chart_quality_score"), 0) or 0))
+    metric_c.metric("Risk/Reward", chart.get("risk_reward", "Unavailable"))
+    metric_d.metric("False Breakout Risk", chart.get("false_breakout_risk", "Unavailable"))
+
+    tab_report, tab_structure, tab_volume, tab_swot, tab_plan, tab_scores = st.tabs(
+        ["Analyst Report", "Structure", "Volume & Footprints", "Chart SWOT", "Trading Plan", "Scores"]
+    )
+
+    with tab_report:
+        for title, body in report["summary"].items():
+            st.markdown(f"**{title}**")
+            st.write(body)
+
+    with tab_structure:
+        structure_rows = [
+            {"Metric": "Chart Stage", "Value": chart.get("chart_stage", "Unavailable")},
+            {"Metric": "Pattern Detected", "Value": chart.get("pattern_detected", "Unavailable")},
+            {"Metric": "Candlestick Signal", "Value": chart.get("candlestick_signal", "Unavailable")},
+            {"Metric": "Support Zone", "Value": chart.get("support_zone", "Unavailable")},
+            {"Metric": "Resistance Zone", "Value": chart.get("resistance_zone", "Unavailable")},
+            {"Metric": "Demand Zone", "Value": chart.get("demand_zone", "Unavailable")},
+            {"Metric": "Supply Zone", "Value": chart.get("supply_zone", "Unavailable")},
+            {"Metric": "Breakout Level", "Value": chart.get("breakout_level", "Unavailable")},
+            {"Metric": "Retest Zone", "Value": chart.get("retest_zone", "Unavailable")},
+            {"Metric": "Final Chart Verdict", "Value": chart.get("final_chart_verdict", "Unavailable")},
+            {"Metric": "Reason", "Value": chart.get("reason", "Unavailable")},
+        ]
+        display_dataframe(pd.DataFrame(structure_rows), height=360)
+        st.markdown("**Multi-Timeframe Analysis**")
+        display_dataframe(report["timeframes"], height=300)
+
+    with tab_volume:
+        volume_rows = [
+            {"Metric": "Volume Confirmation", "Value": chart.get("volume_confirmation", "Unavailable")},
+            {"Metric": "Institutional Footprints", "Value": chart.get("institutional_footprints", "Unavailable")},
+            {"Metric": "Relative Volume", "Value": chart.get("rvol", "Unavailable")},
+            {"Metric": "RSI Context", "Value": chart.get("rsi", "Unavailable")},
+            {"Metric": "Smart Money Interpretation", "Value": report["summary"].get("Institutional Activity", "Unavailable")},
+        ]
+        display_dataframe(pd.DataFrame(volume_rows), height=260)
+        st.info(report["summary"].get("Legendary Analyst Explanation", "Volume and price must confirm each other before action."))
+
+    with tab_swot:
+        display_dataframe(report["swot"], height=260)
+
+    with tab_plan:
+        display_dataframe(report["plan"], height=420)
+        st.caption("This is a research plan. Actual entry requires live confirmation, liquidity, and disciplined risk control.")
+
+    with tab_scores:
+        display_dataframe(report["scores"], height=520)
+
+
 def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("High Accuracy Candidates")
@@ -5878,6 +6237,9 @@ def main() -> None:
         return
     if selected_page == "AI Chart Reading Engine":
         render_ai_chart_reading_page()
+        return
+    if selected_page == "AI Professional Chart Interpretation":
+        render_professional_chart_interpretation_page()
         return
     if selected_page == "AI Early Breakout Score":
         render_ai_early_breakout_page()
