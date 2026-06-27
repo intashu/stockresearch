@@ -5359,12 +5359,25 @@ def resample_chart_timeframe(history: pd.DataFrame, rule: str) -> pd.DataFrame:
     if working.empty:
         return pd.DataFrame()
 
-    return (
-        working.set_index("date")
-        .resample(rule)
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-        .dropna(subset=["open", "high", "low", "close"])
-    )
+    aggregation = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    indexed = working.set_index("date")
+    for candidate_rule in [rule, "ME" if str(rule).upper() == "M" else None, "M" if str(rule).upper() == "ME" else None]:
+        if not candidate_rule:
+            continue
+        try:
+            return indexed.resample(candidate_rule).agg(aggregation).dropna(subset=["open", "high", "low", "close"])
+        except ValueError:
+            continue
+
+    rule_text = str(rule).upper()
+    fallback = working.copy()
+    if rule_text.startswith("W"):
+        fallback["_period"] = fallback["date"].dt.to_period("W-FRI")
+    elif rule_text in {"M", "ME", "MS"}:
+        fallback["_period"] = fallback["date"].dt.to_period("M")
+    else:
+        fallback["_period"] = fallback["date"].dt.to_period("M")
+    return fallback.groupby("_period").agg(aggregation).dropna(subset=["open", "high", "low", "close"])
 
 
 def chart_verdict(score: float) -> str:
