@@ -398,6 +398,13 @@ AI_OVERNIGHT_OPPORTUNITY_CLAUSE = (
     "and latest close * latest volume > 200000000 "
     "and latest close >= 50 ) )"
 )
+AI_CHART_READING_CLAUSE = (
+    "( {cash} ( latest close > latest ema ( close,20 ) "
+    "and latest close > latest ema ( close,50 ) "
+    "and latest close >= latest max ( 252 , latest high ) * 0.80 "
+    "and latest close * latest volume > 200000000 "
+    "and latest close >= 50 ) )"
+)
 
 OVERNIGHT_SCORE_WEIGHTS = {
     "closing_strength_score": 15,
@@ -410,6 +417,17 @@ OVERNIGHT_SCORE_WEIGHTS = {
     "news_catalyst_score": 5,
     "historical_behaviour_score": 5,
     "liquidity_score": 10,
+}
+
+CHART_QUALITY_WEIGHTS = {
+    "trend_clarity_score": 15,
+    "structure_quality_score": 15,
+    "volume_confirmation_score": 15,
+    "pattern_reliability_score": 15,
+    "multi_timeframe_alignment_score": 15,
+    "institutional_footprints_score": 10,
+    "risk_reward_quality_score": 10,
+    "false_breakout_risk_score": 5,
 }
 
 IQ5000_MASTER_WEIGHTS = {
@@ -996,6 +1014,7 @@ def sidebar_page_choice() -> str:
                 "Hedge Fund Stock Picker",
                 "IQ-5000 AI Trading Platform",
                 "AI Overnight Opportunity",
+                "AI Chart Reading Engine",
                 "AI Early Breakout Score",
                 "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
@@ -5300,6 +5319,519 @@ def render_ai_overnight_opportunity_page() -> None:
         display_dataframe(weights_df)
 
 
+def resample_chart_timeframe(history: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if history.empty or "date" not in history.columns:
+        return pd.DataFrame()
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(history.columns):
+        return pd.DataFrame()
+
+    working = history.copy()
+    working["date"] = pd.to_datetime(working["date"], errors="coerce")
+    working = working.dropna(subset=["date"]).sort_values("date")
+    if working.empty:
+        return pd.DataFrame()
+
+    for column in ["open", "high", "low", "close", "volume"]:
+        working[column] = pd.to_numeric(working[column], errors="coerce")
+    working = working.dropna(subset=["open", "high", "low", "close"])
+    if working.empty:
+        return pd.DataFrame()
+
+    return (
+        working.set_index("date")
+        .resample(rule)
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna(subset=["open", "high", "low", "close"])
+    )
+
+
+def chart_verdict(score: float) -> str:
+    if score >= 95:
+        return "Legendary Chart Setup"
+    if score >= 90:
+        return "Elite Chart Setup"
+    if score >= 85:
+        return "High Quality Setup"
+    if score >= 80:
+        return "Watchlist"
+    return "Reject"
+
+
+def classify_chart_stage(current: float, ema50: float, ema200: float, ema200_prior: float, base_tightness: float) -> str:
+    ema200_rising = ema200 >= ema200_prior
+    if current > ema200 and ema50 > ema200 and ema200_rising:
+        return "Stage 2 - Uptrend"
+    if abs(current - ema200) / ema200 <= 0.08 and base_tightness <= 0.18:
+        return "Stage 1 to Stage 2 Transition"
+    if current > ema200 and not ema200_rising:
+        return "Stage 3 - Distribution Risk"
+    if current < ema200 and not ema200_rising:
+        return "Stage 4 - Downtrend"
+    return "Stage 1 - Accumulation"
+
+
+def score_ai_chart_reading_candidate(row: pd.Series) -> dict[str, Any]:
+    symbol = str(row.get("nsecode") or "").strip().upper()
+    history = fetch_ohlcv_history(symbol, lookback_days=900)
+    required = {"open", "high", "low", "close", "volume"}
+    if history.empty or len(history) < 220 or not required.issubset(history.columns):
+        return {"chart_quality_score": 0, "nsecode": symbol, "reason": "Historical OHLCV unavailable or insufficient."}
+
+    df = history.copy()
+    for column in ["open", "high", "low", "close", "volume"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+    if len(df) < 220:
+        return {"chart_quality_score": 0, "nsecode": symbol, "reason": "Not enough clean OHLCV rows."}
+
+    open_price = df["open"]
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    volume = df["volume"]
+    current = float(close.iloc[-1])
+    latest_open = float(open_price.iloc[-1])
+    latest_high = float(high.iloc[-1])
+    latest_low = float(low.iloc[-1])
+    previous_close = close.shift(1)
+    previous_high = high.shift(1)
+    previous_low = low.shift(1)
+    day_range = max(latest_high - latest_low, 0.01)
+    body = abs(current - latest_open)
+    upper_wick = latest_high - max(current, latest_open)
+    lower_wick = min(current, latest_open) - latest_low
+    closing_position = (current - latest_low) / day_range * 100
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    true_range = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
+    atr14 = true_range.rolling(14).mean()
+    latest_atr = float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else current * 0.03
+    range_pct = (high - low) / close
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    bb_width = ((bb_mid + 2 * bb_std) - (bb_mid - 2 * bb_std)) / bb_mid
+    rsi_delta = close.diff()
+    rsi_gain = rsi_delta.clip(lower=0).rolling(14).mean()
+    rsi_loss = (-rsi_delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + (rsi_gain / rsi_loss)))
+    latest_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50
+
+    weekly = resample_chart_timeframe(df, "W-FRI")
+    monthly = resample_chart_timeframe(df, "M")
+    weekly_bullish = False
+    monthly_bullish = False
+    if not weekly.empty and len(weekly) >= 30:
+        weekly_close = weekly["close"]
+        weekly_bullish = bool(weekly_close.iloc[-1] > weekly_close.ewm(span=10, adjust=False).mean().iloc[-1] > weekly_close.ewm(span=30, adjust=False).mean().iloc[-1])
+    if not monthly.empty and len(monthly) >= 12:
+        monthly_close = monthly["close"]
+        monthly_bullish = bool(monthly_close.iloc[-1] > monthly_close.rolling(6).mean().iloc[-1])
+
+    bullish_close = current > latest_open
+    bearish_close = current < latest_open
+    bullish_engulfing = bool(current > open_price.shift(1).iloc[-1] and latest_open < close.shift(1).iloc[-1] and bullish_close)
+    bearish_engulfing = bool(current < open_price.shift(1).iloc[-1] and latest_open > close.shift(1).iloc[-1] and bearish_close)
+    bullish_marubozu = bool(bullish_close and closing_position >= 85 and body / day_range >= 0.65)
+    bearish_marubozu = bool(bearish_close and closing_position <= 20 and body / day_range >= 0.65)
+    hammer = bool(lower_wick >= body * 2 and upper_wick <= body * 0.8 and closing_position >= 55)
+    shooting_star = bool(upper_wick >= body * 2 and lower_wick <= body * 0.8 and closing_position <= 55)
+    doji = bool(body / day_range <= 0.10)
+    inside_bar = bool(latest_high <= previous_high.iloc[-1] and latest_low >= previous_low.iloc[-1])
+    nr7 = bool((high.iloc[-1] - low.iloc[-1]) <= (high - low).tail(7).min())
+    wide_range = bool((high.iloc[-1] - low.iloc[-1]) > (high - low).tail(20).mean() * 1.5)
+    gap_candle = bool(latest_open > previous_high.iloc[-1] or latest_open < previous_low.iloc[-1])
+
+    latest_volume = float(volume.iloc[-1])
+    avg_volume_20 = float(volume.tail(20).mean())
+    avg_volume_50 = float(volume.tail(50).mean())
+    rvol = latest_volume / avg_volume_20 if avg_volume_20 else 0
+    up_volume_expansion = bool(bullish_close and latest_volume > avg_volume_20 * 1.2)
+    down_volume_expansion = bool(bearish_close and latest_volume > avg_volume_20 * 1.2)
+    volume_dryup = bool(volume.shift(1).tail(5).mean() < volume.shift(6).tail(20).mean() * 0.8) if len(volume) > 30 else False
+    down_volume = volume.where(close < previous_close, 0)
+    pocket_pivot = bool(latest_volume > down_volume.shift(1).rolling(10).max().iloc[-1] and current > previous_close.iloc[-1])
+    direction = close.diff().fillna(0).apply(lambda value: 1 if value > 0 else -1 if value < 0 else 0)
+    obv = (direction * volume.fillna(0)).cumsum()
+    obv_rising = bool(obv.iloc[-1] > obv.shift(10).iloc[-1])
+    money_flow_multiplier = ((close - low) - (high - close)) / (high - low).replace(0, pd.NA)
+    ad_line = (money_flow_multiplier.fillna(0) * volume.fillna(0)).cumsum()
+    ad_rising = bool(ad_line.iloc[-1] > ad_line.shift(10).iloc[-1])
+
+    resistance = float(high.tail(55).max())
+    support = float(low.tail(55).min())
+    demand_low = float(low.tail(20).min())
+    demand_high = float(close.tail(20).quantile(0.25))
+    supply_low = float(close.tail(20).quantile(0.75))
+    supply_high = float(high.tail(20).max())
+    breakout_gap = (resistance - current) / resistance * 100 if resistance else None
+    darvas_box = bool(breakout_gap is not None and 0 <= breakout_gap <= 4)
+    atr_contracting = bool(atr14.iloc[-1] < atr14.shift(5).iloc[-1]) if pd.notna(atr14.shift(5).iloc[-1]) else False
+    bb_squeeze = bool(bb_width.iloc[-1] <= bb_width.tail(120).quantile(0.20)) if pd.notna(bb_width.iloc[-1]) else False
+    range_contracting = bool(range_pct.tail(5).mean() < range_pct.shift(5).tail(5).mean())
+    vcp = bool(atr_contracting and bb_squeeze and range_contracting)
+    base_tightness = float((close.tail(40).max() - close.tail(40).min()) / max(close.tail(40).min(), 0.01))
+    flat_base = bool(base_tightness <= 0.12)
+    higher_lows = bool(low.tail(20).min() > low.shift(20).tail(20).min())
+    repeated_tests = int((high.tail(30) >= resistance * 0.985).sum())
+    ascending_triangle = bool(higher_lows and repeated_tests >= 2)
+    wyckoff_accumulation = bool(base_tightness <= 0.18 and obv_rising and higher_lows and not down_volume_expansion)
+    wyckoff_distribution = bool(base_tightness <= 0.18 and not obv_rising and down_volume_expansion)
+    launch_pad_200 = bool(abs(current - ema200.iloc[-1]) / ema200.iloc[-1] <= 0.05 and current >= ema200.iloc[-1] * 0.95)
+    stage2_breakout = bool(current >= resistance * 0.995 and current > ema50.iloc[-1] > ema200.iloc[-1] and up_volume_expansion)
+    double_bottom = bool(low.tail(80).nsmallest(2).max() <= low.tail(80).min() * 1.05 and current > close.tail(80).median())
+    double_top = bool(high.tail(80).nlargest(2).min() >= high.tail(80).max() * 0.95 and current < close.tail(80).median())
+    bull_flag = bool(current > ema20.iloc[-1] and range_contracting and close.tail(20).max() > close.shift(20).tail(20).max())
+    bear_flag = bool(current < ema20.iloc[-1] and range_contracting and close.tail(20).min() < close.shift(20).tail(20).min())
+
+    chart_stage = classify_chart_stage(current, float(ema50.iloc[-1]), float(ema200.iloc[-1]), float(ema200.shift(20).iloc[-1]), base_tightness)
+    daily_bullish = bool(current > ema20.iloc[-1] > ema50.iloc[-1] and current > ema100.iloc[-1])
+    vwap_proxy = float(((high + low + close) / 3).iloc[-1])
+    intraday_15m_proxy = bool(current > vwap_proxy and closing_position >= 60)
+    intraday_5m_proxy = bool(closing_position >= 70 and not shooting_star)
+    timeframe_alignment_score = bounded_score(
+        (3 if monthly_bullish else 0)
+        + (4 if weekly_bullish else 0)
+        + (4 if daily_bullish else 0)
+        + (2 if intraday_15m_proxy else 0)
+        + (2 if intraday_5m_proxy else 0),
+        15,
+    )
+    timeframe_alignment = "; ".join(
+        [
+            "Monthly bullish" if monthly_bullish else "Monthly not confirmed",
+            "Weekly bullish" if weekly_bullish else "Weekly not confirmed",
+            "Daily bullish" if daily_bullish else "Daily weak",
+            "15m proxy bullish" if intraday_15m_proxy else "15m live confirmation needed",
+            "5m proxy clean" if intraday_5m_proxy else "5m live entry pending",
+        ]
+    )
+
+    trend_clarity_score = bounded_score(
+        (4 if current > ema20.iloc[-1] else 0)
+        + (4 if ema20.iloc[-1] > ema50.iloc[-1] else 0)
+        + (3 if ema50.iloc[-1] > ema100.iloc[-1] else 0)
+        + (2 if ema100.iloc[-1] > ema200.iloc[-1] else 0)
+        + (2 if ema200.iloc[-1] > ema200.shift(20).iloc[-1] else 0),
+        15,
+    )
+    structure_quality_score = bounded_score(
+        (4 if darvas_box else 0)
+        + (3 if higher_lows else 0)
+        + (3 if ascending_triangle else 0)
+        + (2 if flat_base else 0)
+        + (2 if current >= resistance * 0.97 else 0)
+        + (1 if support < current < resistance * 1.05 else 0),
+        15,
+    )
+    volume_confirmation_score = bounded_score(
+        (4 if up_volume_expansion else 0)
+        + (3 if pocket_pivot else 0)
+        + (3 if rvol >= 1.5 else 2 if rvol >= 1.2 else 0)
+        + (2 if volume_dryup and up_volume_expansion else 0)
+        + (2 if obv_rising else 0)
+        + (1 if latest_volume > avg_volume_50 else 0),
+        15,
+    )
+    pattern_count = sum([darvas_box, vcp, wyckoff_accumulation, ascending_triangle, flat_base, bull_flag, double_bottom, stage2_breakout, launch_pad_200])
+    pattern_reliability_score = bounded_score(min(pattern_count * 2, 10) + (3 if stage2_breakout else 0) + (2 if vcp and darvas_box else 0), 15)
+    institutional_footprints_score = bounded_score(
+        (2 if higher_lows else 0)
+        + (2 if repeated_tests >= 2 else 0)
+        + (2 if obv_rising else 0)
+        + (2 if ad_rising else 0)
+        + (1 if up_volume_expansion else 0)
+        + (1 if current > vwap_proxy else 0),
+        10,
+    )
+
+    entry_price = resistance * 1.001 if current <= resistance else current
+    stop_loss = min(demand_low, current - latest_atr * 1.5)
+    if stop_loss <= 0 or stop_loss >= entry_price:
+        stop_loss = entry_price * 0.94
+    risk = max(entry_price - stop_loss, 0.01)
+    target_1 = entry_price + risk * 3
+    target_2 = entry_price + risk * 5
+    risk_reward = (target_1 - entry_price) / risk if risk else 0
+    risk_reward_quality_score = bounded_score(10 if risk_reward >= 3 else 7 if risk_reward >= 2.5 else 4 if risk_reward >= 2 else 1, 10)
+
+    false_breakout_risk = 20
+    false_breakout_risk += 25 if latest_rsi > 75 else 0
+    false_breakout_risk += 20 if down_volume_expansion else 0
+    false_breakout_risk += 15 if not up_volume_expansion and current >= resistance * 0.98 else 0
+    false_breakout_risk += 15 if not weekly_bullish else 0
+    false_breakout_risk += 10 if supply_high <= current * 1.03 else 0
+    false_breakout_risk = bounded_score(false_breakout_risk, 100)
+    false_breakout_risk_score = bounded_score((100 - false_breakout_risk) / 20, 5)
+
+    chart_quality_score = bounded_score(
+        trend_clarity_score
+        + structure_quality_score
+        + volume_confirmation_score
+        + pattern_reliability_score
+        + timeframe_alignment_score
+        + institutional_footprints_score
+        + risk_reward_quality_score
+        + false_breakout_risk_score,
+        100,
+    )
+
+    patterns = []
+    if darvas_box:
+        patterns.append("Darvas Box")
+    if vcp:
+        patterns.append("VCP")
+    if wyckoff_accumulation:
+        patterns.append("Wyckoff Accumulation")
+    if wyckoff_distribution:
+        patterns.append("Wyckoff Distribution")
+    if ascending_triangle:
+        patterns.append("Ascending Triangle")
+    if flat_base:
+        patterns.append("Flat Base")
+    if bull_flag:
+        patterns.append("Bull Flag")
+    if bear_flag:
+        patterns.append("Bear Flag")
+    if double_bottom:
+        patterns.append("Double Bottom")
+    if double_top:
+        patterns.append("Double Top")
+    if stage2_breakout:
+        patterns.append("Stage-2 Breakout")
+    if launch_pad_200:
+        patterns.append("200 EMA Launch Pad")
+
+    candles = []
+    if bullish_marubozu:
+        candles.append("Bullish Marubozu")
+    if bearish_marubozu:
+        candles.append("Bearish Marubozu")
+    if bullish_engulfing:
+        candles.append("Bullish Engulfing")
+    if bearish_engulfing:
+        candles.append("Bearish Engulfing")
+    if hammer:
+        candles.append("Hammer")
+    if shooting_star:
+        candles.append("Shooting Star")
+    if doji:
+        candles.append("Doji")
+    if inside_bar:
+        candles.append("Inside Bar")
+    if nr7:
+        candles.append("NR7")
+    if wide_range:
+        candles.append("Wide Range Candle")
+    if gap_candle:
+        candles.append("Gap Candle")
+
+    volume_confirmation = "Confirmed" if volume_confirmation_score >= 10 else "Partial" if volume_confirmation_score >= 6 else "Weak"
+    institutional_footprints = "Strong" if institutional_footprints_score >= 8 else "Present" if institutional_footprints_score >= 5 else "Weak"
+    entry_trigger = (
+        "Breakout above resistance with volume confirmation and VWAP hold"
+        if chart_quality_score >= 90
+        else "Watch for breakout/retest confirmation before entry"
+    )
+    retest_low = max(resistance - latest_atr * 0.50, 0)
+    retest_high = resistance + latest_atr * 0.25
+    reason = []
+    if chart_stage.startswith("Stage 2"):
+        reason.append("Stage 2 trend structure")
+    if darvas_box or vcp:
+        reason.append("base/compression near resistance")
+    if volume_confirmation_score >= 10:
+        reason.append("volume supports the setup")
+    if timeframe_alignment_score >= 10:
+        reason.append("multi-timeframe alignment is supportive")
+    if false_breakout_risk >= 60:
+        reason.append("false breakout risk remains elevated")
+
+    return {
+        "stock_name": row.get("name", symbol),
+        "nsecode": symbol,
+        "timeframe_alignment": timeframe_alignment,
+        "chart_stage": chart_stage,
+        "chart_quality_score": chart_quality_score,
+        "trend_clarity_score": trend_clarity_score,
+        "structure_quality_score": structure_quality_score,
+        "volume_confirmation_score": volume_confirmation_score,
+        "pattern_reliability_score": pattern_reliability_score,
+        "multi_timeframe_alignment_score": timeframe_alignment_score,
+        "institutional_footprints_score": institutional_footprints_score,
+        "risk_reward_quality_score": risk_reward_quality_score,
+        "false_breakout_risk_score": false_breakout_risk_score,
+        "pattern_detected": ", ".join(patterns) if patterns else "No major pattern confirmed",
+        "candlestick_signal": ", ".join(candles) if candles else "No major candle signal",
+        "support_zone": f"{support:.2f} - {demand_high:.2f}",
+        "resistance_zone": f"{supply_low:.2f} - {resistance:.2f}",
+        "demand_zone": f"{demand_low:.2f} - {demand_high:.2f}",
+        "supply_zone": f"{supply_low:.2f} - {supply_high:.2f}",
+        "breakout_level": round(resistance, 2),
+        "retest_zone": f"{retest_low:.2f} - {retest_high:.2f}",
+        "entry_trigger": entry_trigger,
+        "entry_price": round(entry_price, 2),
+        "stop_loss": round(stop_loss, 2),
+        "target_1": round(target_1, 2),
+        "target_2": round(target_2, 2),
+        "risk_reward": round(risk_reward, 2),
+        "false_breakout_risk": false_breakout_risk,
+        "volume_confirmation": volume_confirmation,
+        "institutional_footprints": institutional_footprints,
+        "final_chart_verdict": chart_verdict(chart_quality_score),
+        "current_price": round(current, 2),
+        "rvol": round(rvol, 2),
+        "rsi": round(latest_rsi, 2),
+        "reason": "; ".join(reason) if reason else "Chart does not yet show enough high-quality confirmation.",
+    }
+
+
+def build_ai_chart_reading_model(df: pd.DataFrame, history_limit: int = 80) -> pd.DataFrame:
+    if df.empty:
+        return df
+    rows: list[dict[str, Any]] = []
+    for _, row in df.head(history_limit).iterrows():
+        try:
+            scored = score_ai_chart_reading_candidate(row)
+        except Exception as exc:
+            scored = {
+                "chart_quality_score": 0,
+                "nsecode": row.get("nsecode", ""),
+                "reason": f"Chart scoring skipped: {exc}",
+            }
+        if isinstance(scored, dict) and (coerce_float(scored.get("chart_quality_score"), 0) or 0) > 0:
+            rows.append(scored)
+    model = pd.DataFrame(rows)
+    if model.empty:
+        return model
+    return safe_sort_dataframe(model, ["chart_quality_score", "risk_reward", "false_breakout_risk"], [False, False, True])
+
+
+def apply_ai_chart_reading_filters(
+    model: pd.DataFrame,
+    min_chart_quality: int,
+    min_risk_reward: float,
+    max_false_breakout_risk: int,
+    require_higher_timeframe: bool,
+    require_volume_confirmation: bool,
+) -> pd.DataFrame:
+    if model.empty:
+        return model
+    filtered = model[
+        (pd.to_numeric(model["chart_quality_score"], errors="coerce") >= min_chart_quality)
+        & (pd.to_numeric(model["risk_reward"], errors="coerce") >= min_risk_reward)
+        & (pd.to_numeric(model["false_breakout_risk"], errors="coerce") <= max_false_breakout_risk)
+    ].copy()
+    if require_higher_timeframe:
+        filtered = filtered[
+            filtered["timeframe_alignment"].astype(str).str.contains("Monthly bullish", na=False)
+            & filtered["timeframe_alignment"].astype(str).str.contains("Weekly bullish", na=False)
+        ]
+    if require_volume_confirmation:
+        filtered = filtered[filtered["volume_confirmation"].astype(str).isin(["Confirmed"])]
+    return safe_sort_dataframe(filtered, ["chart_quality_score", "risk_reward"], [False, False])
+
+
+def ai_chart_reading_display_columns(df: pd.DataFrame) -> list[str]:
+    columns = [
+        "stock_name",
+        "nsecode",
+        "timeframe_alignment",
+        "chart_stage",
+        "chart_quality_score",
+        "pattern_detected",
+        "candlestick_signal",
+        "support_zone",
+        "resistance_zone",
+        "breakout_level",
+        "retest_zone",
+        "entry_trigger",
+        "entry_price",
+        "stop_loss",
+        "target_1",
+        "target_2",
+        "risk_reward",
+        "false_breakout_risk",
+        "volume_confirmation",
+        "institutional_footprints",
+        "final_chart_verdict",
+        "reason",
+    ]
+    return [column for column in columns if column in df.columns]
+
+
+def render_ai_chart_reading_page() -> None:
+    st.subheader("AI Chart Reading Engine")
+    st.caption("Reads price action, volume, structure, trend, support-resistance, compression, expansion, institutional footprints, and multi-timeframe alignment.")
+
+    with st.sidebar:
+        st.header("Chart Reading Controls")
+        rows_shown = st.slider("Rows shown", 5, 100, 25, 5, key="chart_reading_rows")
+        history_limit = st.slider("Candidates to score", 20, 180, 80, 20, key="chart_reading_history")
+        st.divider()
+        min_chart_quality = st.slider("Minimum chart quality score", 0, 100, 80, 1, key="chart_min_quality")
+        min_risk_reward = st.slider("Minimum risk/reward", 1.0, 5.0, 3.0, 0.25, key="chart_min_rr")
+        max_false_breakout_risk = st.slider("Maximum false breakout risk", 0, 100, 55, 5, key="chart_max_false")
+        require_higher_timeframe = st.toggle("Require monthly + weekly bullish", value=False, key="chart_require_htf")
+        require_volume_confirmation = st.toggle("Require volume confirmation", value=False, key="chart_require_volume")
+        if st.button("Refresh chart reading engine", type="primary", width="stretch"):
+            run_scan.clear()
+            fetch_ohlcv_history.clear()
+            st.rerun()
+
+    with st.expander("Chart Quality Model", expanded=True):
+        weights_df = pd.DataFrame(
+            [{"Component": key.replace("_", " ").title(), "Weight": value} for key, value in CHART_QUALITY_WEIGHTS.items()]
+        )
+        display_dataframe(weights_df)
+
+    with st.spinner("Fetching and reading charts..."):
+        df, error = run_scan(AI_CHART_READING_CLAUSE)
+    if error:
+        st.error(error)
+        st.caption("If Chartink rejects the pre-filter, adjust AI_CHART_READING_CLAUSE.")
+        return
+
+    model = build_ai_chart_reading_model(df, history_limit=history_limit)
+    if model.empty:
+        st.info("No charts could be scored from the current pre-filter.")
+        return
+
+    filtered = apply_ai_chart_reading_filters(
+        model,
+        min_chart_quality=min_chart_quality,
+        min_risk_reward=min_risk_reward,
+        max_false_breakout_risk=max_false_breakout_risk,
+        require_higher_timeframe=require_higher_timeframe,
+        require_volume_confirmation=require_volume_confirmation,
+    )
+
+    metric_a, metric_b, metric_c = st.columns(3)
+    metric_a.metric("Charts scored", len(model))
+    metric_b.metric("Qualified charts", len(filtered))
+    metric_c.metric("Top chart score", int((filtered if not filtered.empty else model).iloc[0]["chart_quality_score"]))
+
+    if filtered.empty:
+        st.warning("No chart passes the current Module 19 quality filter. Review the scored universe below or loosen controls.")
+    else:
+        st.subheader("Qualified Chart Setups")
+        table = filtered[ai_chart_reading_display_columns(filtered)].head(rows_shown)
+        display_dataframe(table, height=640)
+        st.download_button(
+            "Download AI chart reading candidates CSV",
+            filtered.to_csv(index=False).encode("utf-8"),
+            file_name="ai_chart_reading_candidates.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    with st.expander("Scored chart universe before filters", expanded=filtered.empty):
+        display_dataframe(model[ai_chart_reading_display_columns(model)].head(rows_shown), height=620)
+
+
 def render_high_accuracy_table(high_accuracy_df: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("High Accuracy Candidates")
@@ -5343,6 +5875,9 @@ def main() -> None:
         return
     if selected_page == "AI Overnight Opportunity":
         render_ai_overnight_opportunity_page()
+        return
+    if selected_page == "AI Chart Reading Engine":
+        render_ai_chart_reading_page()
         return
     if selected_page == "AI Early Breakout Score":
         render_ai_early_breakout_page()
