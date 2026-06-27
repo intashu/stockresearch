@@ -30,7 +30,7 @@ except ImportError:  # Optional dependency for local OHLCV enrichment.
     yf = None
 
 
-APP_TITLE = "Chartink Multi-Screener Signal Dashboard"
+APP_TITLE = "IQ-5000 NSE Intelligence Platform"
 TOKEN_URL = "https://chartink.com/screener/"
 PROCESS_URL = "https://chartink.com/screener/process"
 REQUEST_TIMEOUT = 20
@@ -96,38 +96,276 @@ def inject_css() -> None:
         <style>
         :root {
             --surface: #ffffff;
+            --surface-soft: #f8fafc;
             --muted: #64748b;
+            --text: #0f172a;
             --border: #e2e8f0;
-            --accent: #2563eb;
-            --accent-dark: #1d4ed8;
-            --bg: #f8fafc;
+            --accent: #0f4c81;
+            --accent-dark: #08375f;
+            --accent-soft: #e0f2fe;
+            --success: #10b981;
+            --danger: #e11d48;
+            --warning: #f59e0b;
+            --bg: #f3f6fa;
+            --shadow: 0 16px 42px rgba(15, 23, 42, .08);
         }
 
         .stApp {
-            background: var(--bg);
+            background:
+                radial-gradient(circle at top left, rgba(14, 165, 233, .10), transparent 34rem),
+                linear-gradient(180deg, #f8fafc 0%, var(--bg) 38%, #eef3f8 100%);
+            color: var(--text);
         }
 
         .block-container {
-            padding-top: 1.5rem;
-            padding-bottom: 2rem;
+            padding-top: 1.15rem;
+            padding-bottom: 2.3rem;
+            max-width: 1480px;
+        }
+
+        section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #0f172a 0%, #111827 56%, #0b1120 100%);
+            border-right: 1px solid rgba(148, 163, 184, .22);
+        }
+
+        section[data-testid="stSidebar"] * {
+            color: #e5e7eb;
+        }
+
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] p,
+        section[data-testid="stSidebar"] small {
+            color: #cbd5e1 !important;
+        }
+
+        section[data-testid="stSidebar"] [data-baseweb="select"] > div,
+        section[data-testid="stSidebar"] textarea,
+        section[data-testid="stSidebar"] input {
+            background: rgba(255,255,255,.08) !important;
+            border-color: rgba(148, 163, 184, .28) !important;
+            color: #f8fafc !important;
+            border-radius: 10px !important;
+        }
+
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3 {
+            color: #f8fafc;
+        }
+
+        .sidebar-brand {
+            border: 1px solid rgba(148, 163, 184, .24);
+            border-radius: 14px;
+            padding: 14px 14px 12px;
+            margin: 4px 0 14px;
+            background: linear-gradient(135deg, rgba(14, 165, 233, .18), rgba(16, 185, 129, .10));
+        }
+
+        .sidebar-brand-title {
+            font-size: 1rem;
+            font-weight: 850;
+            letter-spacing: .05em;
+            text-transform: uppercase;
+            color: #ffffff;
+        }
+
+        .sidebar-brand-subtitle {
+            font-size: .78rem;
+            color: #cbd5e1;
+            margin-top: 4px;
+            line-height: 1.35;
+        }
+
+        .sidebar-status {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+
+        .sidebar-status div {
+            border: 1px solid rgba(148, 163, 184, .22);
+            border-radius: 12px;
+            padding: 8px;
+            background: rgba(255,255,255,.06);
+        }
+
+        .sidebar-status strong {
+            display: block;
+            font-size: .78rem;
+            color: #ffffff;
+        }
+
+        .sidebar-status span {
+            font-size: .7rem;
+            color: #94a3b8;
+        }
+
+        div[data-testid="stButton"] > button,
+        div[data-testid="stDownloadButton"] > button {
+            border-radius: 10px;
+            border: 1px solid rgba(15, 76, 129, .24);
+            font-weight: 750;
+            box-shadow: 0 8px 18px rgba(15, 23, 42, .07);
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"] {
+            background: linear-gradient(135deg, var(--accent) 0%, #2563eb 100%);
+            border-color: transparent;
+        }
+
+        [data-testid="stMetric"] {
+            background: rgba(255,255,255,.82);
+            border: 1px solid rgba(226, 232, 240, .95);
+            border-radius: 12px;
+            padding: 12px 14px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, .05);
+        }
+
+        [data-testid="stMetricLabel"] p {
+            color: var(--muted);
+            font-size: .78rem;
+            font-weight: 800;
+            letter-spacing: .04em;
+            text-transform: uppercase;
         }
 
         [data-testid="stMetricValue"] {
-            font-size: 1.35rem;
+            font-size: 1.28rem;
+            font-weight: 800;
+            color: var(--text);
+        }
+
+        [data-testid="stDataFrame"] {
+            border: 1px solid rgba(226, 232, 240, .95);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, .04);
+        }
+
+        [data-testid="stExpander"] {
+            border: 1px solid rgba(226, 232, 240, .95);
+            border-radius: 12px;
+            background: rgba(255,255,255,.78);
+            box-shadow: 0 8px 24px rgba(15, 23, 42, .035);
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 10px 10px 0 0;
+            padding: 10px 14px;
+            font-weight: 750;
+            color: var(--muted);
+        }
+
+        .stTabs [aria-selected="true"] {
+            background: #ffffff;
+            color: var(--accent) !important;
+            border: 1px solid var(--border);
+            border-bottom: 1px solid #ffffff;
+        }
+
+        h1, h2, h3 {
+            color: var(--text);
+            letter-spacing: -.01em;
+        }
+
+        h2 {
+            margin-top: .4rem;
+        }
+
+        .dashboard-hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 18px;
+            border: 1px solid rgba(226, 232, 240, .96);
+            border-radius: 18px;
+            padding: 22px 24px;
+            margin-bottom: 18px;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,.96) 0%, rgba(248,250,252,.94) 58%, rgba(224,242,254,.75) 100%);
+            box-shadow: var(--shadow);
+        }
+
+        .dashboard-kicker {
+            color: var(--accent);
+            font-size: .78rem;
+            font-weight: 850;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+            margin-bottom: 6px;
         }
 
         .dashboard-title {
-            font-size: 2rem;
-            font-weight: 760;
+            font-size: clamp(1.7rem, 2.4vw, 2.35rem);
+            font-weight: 900;
             line-height: 1.1;
-            color: #0f172a;
-            margin-bottom: .2rem;
+            color: var(--text);
+            margin: 0 0 .35rem;
         }
 
         .dashboard-subtitle {
             color: var(--muted);
             font-size: .98rem;
-            margin-bottom: 1.1rem;
+            margin: 0;
+            max-width: 900px;
+            line-height: 1.5;
+        }
+
+        .hero-status {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            gap: 8px;
+            min-width: 260px;
+        }
+
+        .hero-chip {
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 7px 11px;
+            background: rgba(255,255,255,.82);
+            color: #334155;
+            font-size: .78rem;
+            font-weight: 750;
+            white-space: nowrap;
+        }
+
+        .hero-chip.primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #ffffff;
+        }
+
+        .professional-callout {
+            border: 1px solid rgba(15, 76, 129, .18);
+            border-left: 4px solid var(--accent);
+            border-radius: 12px;
+            padding: 12px 14px;
+            background: rgba(224, 242, 254, .48);
+            color: #0f172a;
+            margin: 8px 0 18px;
+        }
+
+        .professional-callout strong {
+            color: var(--accent-dark);
+        }
+
+        @media (max-width: 900px) {
+            .dashboard-hero {
+                grid-template-columns: 1fr;
+                padding: 18px;
+            }
+
+            .hero-status {
+                justify-content: flex-start;
+                min-width: 0;
+            }
         }
 
         .scan-heading {
@@ -154,7 +392,9 @@ def inject_css() -> None:
             color: var(--muted);
             text-align: center;
             font-size: .85rem;
-            margin-top: 1rem;
+            margin-top: 1.2rem;
+            border-top: 1px solid var(--border);
+            padding-top: 1rem;
         }
 
         .analysis-shell {
@@ -923,9 +1163,28 @@ def maybe_autorefresh(enabled: bool, seconds: int) -> None:
 
 
 def render_header() -> None:
-    st.markdown(f'<div class="dashboard-title">{APP_TITLE}</div>', unsafe_allow_html=True)
+    today_label = date.today().strftime("%d %b %Y")
     st.markdown(
-        '<div class="dashboard-subtitle">A structured Chartink dashboard for comparing breakout, volume, trend, risk, and fundamental screens.</div>',
+        f"""
+        <div class="dashboard-hero">
+            <div>
+                <div class="dashboard-kicker">IQ-5000 Research Workstation</div>
+                <div class="dashboard-title">{APP_TITLE}</div>
+                <div class="dashboard-subtitle">
+                    Professional NSE screening, AI chart reading, market-memory scoring, risk planning, replay validation, and institutional-style decision support in one Streamlit cockpit.
+                </div>
+            </div>
+            <div class="hero-status">
+                <span class="hero-chip primary">Research Mode</span>
+                <span class="hero-chip">Updated {today_label}</span>
+                <span class="hero-chip">No forced trades</span>
+                <span class="hero-chip">{len(ADVANCED_IQ_MODULES)} IQ modules</span>
+            </div>
+        </div>
+        <div class="professional-callout">
+            <strong>Decision standard:</strong> use these screens as evidence, not prediction. Capital deployment should wait for liquidity, market regime, live confirmation, and clean risk/reward.
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -1012,27 +1271,48 @@ def sidebar_controls() -> tuple[list[Scan], str, bool, bool, int, int]:
 
 def sidebar_page_choice() -> str:
     with st.sidebar:
-        return st.radio(
-            "Workspace",
-            [
+        st.markdown(
+            """
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-title">IQ-5000 Console</div>
+                <div class="sidebar-brand-subtitle">Screeners, chart intelligence, risk engines, and professional research modules.</div>
+            </div>
+            <div class="sidebar-status">
+                <div><strong>Mode</strong><span>Research</span></div>
+                <div><strong>Source</strong><span>Chartink + OHLCV</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        page_groups = {
+            "Core Dashboards": [
                 "Multi-Screener Dashboard",
                 "Institutional Breakout Setup",
                 "Breakout Probability Model",
                 "Hedge Fund Stock Picker",
                 "IQ-5000 AI Trading Platform",
                 "AI Overnight Opportunity",
+            ],
+            "Chart Workstation": [
                 "AI Chart Reading Engine",
                 "AI Custom Chart Engine",
                 "AI Professional Chart Interpretation",
                 "AI Interactive Chart Teacher",
                 "AI Chart Reading & Replay",
-                *list(ADVANCED_IQ_MODULES.values()),
-                "AI Early Breakout Score",
-                "200 EMA/SMA Launch Pad",
                 "Stock Technicals & SWOT Card",
             ],
-            index=0,
-        )
+            "Breakout Models": [
+                "AI Early Breakout Score",
+                "200 EMA/SMA Launch Pad",
+            ],
+            "IQ Modules 23-40": list(ADVANCED_IQ_MODULES.values()),
+        }
+        group = st.selectbox("Workspace group", list(page_groups), index=0, key="workspace_group")
+        pages = page_groups[group]
+        page_key = f"workspace_page_{re.sub(r'[^a-z0-9]+', '_', group.lower()).strip('_')}"
+        selected_page = st.selectbox("Module", pages, index=0, key=page_key)
+        st.caption("Tip: start with Core Dashboards, then validate a symbol in Chart Workstation.")
+        return selected_page
 
 
 def sort_results(df: pd.DataFrame, column: str, descending: bool = True) -> pd.DataFrame:
@@ -8622,7 +8902,7 @@ def main() -> None:
                 render_scan_card(scan, df, error, rows_per_scan)
 
     st.markdown(
-        '<div class="footer-note">Data source: Chartink. This dashboard is for screening and research workflows, not financial advice.</div>',
+        '<div class="footer-note">Data sources: Chartink, NSE, Yahoo Finance, and user-uploaded OHLCV where available. This platform is for screening and research workflows, not financial advice.</div>',
         unsafe_allow_html=True,
     )
 
